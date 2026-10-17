@@ -1,6 +1,6 @@
 [package]
 name = "cmdnavi"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Manage a personal command reference"
@@ -12,8 +12,10 @@ keywords = ["cli", "command", "reference", "yaml"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 shell-words = "1"
+unicode-width = "0.2"
 yaml_serde = "0.10"
 
 [dev-dependencies]

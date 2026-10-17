@@ -63,10 +63,12 @@ fn help_version_and_argument_errors_have_expected_exit_codes() {
 
     let version = run(dir.path(), &["--version"], "");
     assert!(version.status.success());
-    assert_eq!(stdout(&version), "cmdnavi 1.0.0\n");
+    assert_eq!(
+        stdout(&version),
+        concat!("cmdnavi ", env!("CARGO_PKG_VERSION"), "\n")
+    );
 
     for (args, expected) in [
-        (vec!["add"], "needs a category"),
         (vec!["remove"], "needs a category"),
         (vec!["list", "extra"], "does not accept arguments"),
         (vec!["--unknown"], "unknown option"),
@@ -276,4 +278,240 @@ fn concurrent_adds_are_all_preserved() {
     for index in 0..8 {
         assert!(shown.contains(&format!("command-{index}")));
     }
+}
+
+#[test]
+fn home_guides_first_use_and_summarizes_saved_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = run(dir.path(), &[], "");
+    assert!(empty.status.success());
+    assert!(stdout(&empty).contains("cmdnavi add network"));
+    assert!(!dir.path().join("cmdnavi/config.yaml").exists());
+    assert!(
+        run(dir.path(), &["add", "network"], "ip addr\nIPアドレス\n")
+            .status
+            .success()
+    );
+    let home = stdout(&run(dir.path(), &[], ""));
+    assert!(home.contains("1 categories · 1 commands"));
+    assert!(home.contains("network"));
+    assert!(home.contains("--search"));
+}
+
+#[test]
+fn search_finds_categories_commands_and_unicode_descriptions_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        run(
+            dir.path(),
+            &["add", "network"],
+            "ip addr\nIPアドレスを確認\n"
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run(
+            dir.path(),
+            &["add", "containers"],
+            "docker ps\nコンテナ一覧\n"
+        )
+        .status
+        .success()
+    );
+    let path = dir.path().join("cmdnavi/config.yaml");
+    let before = fs::read(&path).unwrap();
+    for query in ["NETWORK", "IP ADDR", "アドレス"] {
+        let found = run(dir.path(), &["--search", query], "");
+        assert!(found.status.success());
+        assert!(stdout(&found).contains("[network]"));
+        assert!(stdout(&found).contains("ip addr"));
+        assert!(!stdout(&found).contains("docker ps"));
+    }
+    assert!(stdout(&run(dir.path(), &["--search", "missing"], "")).contains("No matches"));
+    for args in [vec!["--search"], vec!["--search", "  "]] {
+        assert!(!run(dir.path(), &args, "").status.success());
+    }
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn removal_can_be_cancelled_before_selecting_and_accepts_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        run(dir.path(), &["add", "network"], "ip addr\nshow IP\n")
+            .status
+            .success()
+    );
+    for input in ["\n", "q\n", " Q \n"] {
+        let cancelled = run(dir.path(), &["remove", "network"], input);
+        assert!(cancelled.status.success());
+        assert!(stdout(&cancelled).contains("Cancelled."));
+        assert!(stdout(&run(dir.path(), &["network"], "")).contains("ip addr"));
+    }
+    assert!(
+        run(dir.path(), &["remove", "network"], "1\n YES \n")
+            .status
+            .success()
+    );
+    assert!(stdout(&run(dir.path(), &["network"], "")).contains("cmdnavi add network"));
+}
+
+#[test]
+fn multiline_descriptions_are_indented_and_command_help_never_mutates_data() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("cmdnavi")).unwrap();
+    let path = dir.path().join("cmdnavi/config.yaml");
+    fs::write(
+        &path,
+        "network:\n  - command: ip addr\n    description: |\n      first line\n      second line\n",
+    )
+    .unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(stdout(&run(dir.path(), &["network"], "")).contains("  first line\n  second line\n"));
+    for command in ["add", "remove", "edit", "list"] {
+        let help = run(dir.path(), &[command, "--help"], "");
+        assert!(help.status.success());
+        assert!(stdout(&help).contains("Usage:"));
+    }
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn guided_add_selects_categories_retries_and_allows_optional_descriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = run(dir.path(), &["add"], "bad name\nnetwork\n\nip addr\n\n");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stdout(&first).contains("Enter a command to save"));
+    let second = run(dir.path(), &["add"], "#99\n#1\nss -tulpn\nports\n");
+    assert!(second.status.success(), "{}", stderr(&second));
+    let saved = cmdnavi::config::load(&dir.path().join("cmdnavi/config.yaml")).unwrap();
+    assert_eq!(saved["network"].len(), 2);
+    assert_eq!(saved["network"][0].description, "");
+    let default = run(dir.path(), &["add"], "\npwd\n\n");
+    assert!(default.status.success(), "{}", stderr(&default));
+    assert!(stdout(&run(dir.path(), &["general"], "")).contains("pwd"));
+}
+
+#[test]
+fn add_cancellation_and_incomplete_input_never_save_partial_entries() {
+    for input in [
+        "/cancel\n",
+        "network\n/cancel\n",
+        "network\nip addr\n/cancel\n",
+        "network\nip addr\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let output = run(dir.path(), &["add"], input);
+        assert_eq!(output.status.success(), input.contains("/cancel"));
+        assert!(!dir.path().join("cmdnavi/config.yaml").exists());
+    }
+}
+
+#[test]
+fn quick_add_deduplicates_and_updates_only_with_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cmdnavi/config.yaml");
+    let command = "printf '%s' \"$(touch never-run)\"";
+    assert!(
+        run(dir.path(), &["add", "shell", command, "old"], "")
+            .status
+            .success()
+    );
+    let before = fs::read(&path).unwrap();
+    assert!(
+        run(dir.path(), &["add", "shell", command, "old"], "")
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(
+        run(dir.path(), &["add", "shell", command, "new"], "n\n")
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(
+        run(dir.path(), &["add", "shell", command, "new"], "yes\n")
+            .status
+            .success()
+    );
+    let saved = cmdnavi::config::load(&path).unwrap();
+    assert_eq!(saved["shell"].len(), 1);
+    assert_eq!(saved["shell"][0].command, command);
+    assert_eq!(saved["shell"][0].description, "new");
+    assert!(
+        run(dir.path(), &["add", "shell", "pwd"], "")
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn item_edit_keeps_values_clears_description_and_rejects_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cmdnavi/config.yaml");
+    assert!(
+        run(dir.path(), &["add", "network", "ip addr", "old"], "")
+            .status
+            .success()
+    );
+    assert!(
+        run(dir.path(), &["edit", "network", "1"], "\nnew\n")
+            .status
+            .success()
+    );
+    let saved = cmdnavi::config::load(&path).unwrap();
+    assert_eq!(saved["network"][0].command, "ip addr");
+    assert_eq!(saved["network"][0].description, "new");
+    assert!(
+        run(dir.path(), &["edit", "network", "1"], "ip link\n/clear\n")
+            .status
+            .success()
+    );
+    assert_eq!(
+        cmdnavi::config::load(&path).unwrap()["network"][0].description,
+        ""
+    );
+    assert!(
+        run(dir.path(), &["add", "network", "pwd"], "")
+            .status
+            .success()
+    );
+    let before = fs::read(&path).unwrap();
+    assert!(
+        !run(dir.path(), &["edit", "network", "1"], "pwd\n\n")
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    for number in ["0", "99", "bad"] {
+        assert!(
+            !run(dir.path(), &["edit", "network", number], "")
+                .status
+                .success()
+        );
+    }
+    assert!(
+        run(dir.path(), &["edit", "network", "1"], "/cancel\n")
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn remove_retries_invalid_selection_and_browser_requires_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        run(dir.path(), &["add", "network", "ip addr"], "")
+            .status
+            .success()
+    );
+    let removed = run(dir.path(), &["remove", "network"], "bad\n0\n99\n1\ny\n");
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let browse = run(dir.path(), &["--browse"], "");
+    assert!(!browse.status.success());
+    assert!(stderr(&browse).contains("needs a terminal"));
+    assert!(!stdout(&browse).contains('\x1b'));
 }

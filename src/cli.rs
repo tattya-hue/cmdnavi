@@ -8,9 +8,10 @@ use std::path::Path;
 pub const HELP: &str = "cmdnavi - manage your personal command reference
 
 Usage:
+  cmdnavi
   cmdnavi <category>
-  cmdnavi add <category>
-  cmdnavi edit [category]
+  cmdnavi add [category] [\"command\"] [\"description\"]
+  cmdnavi edit [category] [item-number]
   cmdnavi list
   cmdnavi remove <category>
 
@@ -21,8 +22,17 @@ Commands:
   remove    Remove a command
 
 Options:
+  --browse        Browse, filter, copy and edit interactively
+  --search <text>  Search categories, commands and descriptions
   -h, --help       Show help
   -v, --version    Show version
+
+Examples:
+  cmdnavi add network
+  cmdnavi network
+  cmdnavi --search \"IP address\"
+
+Saved commands are displayed, never executed.
 ";
 
 pub fn run(
@@ -32,15 +42,25 @@ pub fn run(
     output: &mut dyn Write,
 ) -> Result<()> {
     match args {
-        [] => write!(output, "{HELP}")?,
+        [] => overview(path, output)?,
         [one] => match one.as_str() {
             "-h" | "--help" | "help" => write!(output, "{HELP}")?,
             "-v" | "--version" | "version" => {
                 writeln!(output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
             }
             "list" => list(path, output)?,
+            "--search" => {
+                return Err(Error(
+                    "search needs some text.\nTry `cmdnavi --search docker`.".into(),
+                ));
+            }
             "edit" => editor::edit_all_interactive(path, &ExternalEditor, input, output)?,
-            "add" | "remove" => return Err(missing_category(one)),
+            "add" => {
+                if let Some(category) = crate::interaction::choose_category(path, input, output)? {
+                    add(path, &category, input, output)?;
+                }
+            }
+            "remove" => return Err(missing_category(one)),
             option if option.starts_with('-') => {
                 return Err(Error(format!(
                     "unknown option \"{option}\".\nRun `cmdnavi --help` and choose one of the supported options.\n\n{HELP}"
@@ -48,6 +68,50 @@ pub fn run(
             }
             category => show(path, category, output)?,
         },
+        [action, category, command] if action == "add" => crate::interaction::save_entry(
+            path,
+            category,
+            CommandEntry {
+                command: command.clone(),
+                description: String::new(),
+            },
+            input,
+            output,
+        )?,
+        [action, category, command, description] if action == "add" => {
+            crate::interaction::save_entry(
+                path,
+                category,
+                CommandEntry {
+                    command: command.clone(),
+                    description: description.clone(),
+                },
+                input,
+                output,
+            )?
+        }
+        [action, category, number] if action == "edit" => {
+            checked_category(category)?;
+            let data = config::load(path)?;
+            let entries = data.get(category).ok_or_else(|| {
+                Error(format!(
+                    "Category \"{category}\" does not exist. Run `cmdnavi list`."
+                ))
+            })?;
+            let index = number
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .ok_or_else(|| Error("Choose an item number starting at 1.".into()))?;
+            crate::interaction::edit_entry(path, category, index, entries, input, output)?;
+        }
+        [command, query] if command == "--search" => search(path, query, output)?,
+        [command, option]
+            if matches!(command.as_str(), "add" | "edit" | "remove" | "list")
+                && matches!(option.as_str(), "--help" | "-h") =>
+        {
+            write!(output, "{HELP}")?
+        }
         [command, category] if command == "add" => add(path, category, input, output)?,
         [command, category] if command == "edit" => {
             checked_category(category)?;
@@ -88,11 +152,92 @@ pub fn show(path: &Path, category: &str, output: &mut dyn Write) -> Result<()> {
                 "category \"{category}\" does not exist.\nRun `cmdnavi list` to see your categories. To create it, use `cmdnavi add {category}` or `cmdnavi edit {category}`."
             ))
         })?;
+    if entries.is_empty() {
+        writeln!(
+            output,
+            "No commands in \"{category}\" yet.\nAdd one with `cmdnavi add {category}`."
+        )?;
+    }
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             writeln!(output)?;
         }
-        writeln!(output, "{}\n  {}", entry.command, entry.description)?;
+        write_entry(output, entry)?;
+    }
+    Ok(())
+}
+
+fn write_entry(output: &mut dyn Write, entry: &CommandEntry) -> Result<()> {
+    writeln!(output, "{}", entry.command)?;
+    for line in entry.description.lines() {
+        writeln!(output, "  {line}")?;
+    }
+    Ok(())
+}
+
+pub fn overview(path: &Path, output: &mut dyn Write) -> Result<()> {
+    let data = config::load(path)?;
+    writeln!(output, "cmdnavi — your command reference\n")?;
+    if data.is_empty() {
+        writeln!(
+            output,
+            "No commands saved yet.\n\nGet started:  cmdnavi add network"
+        )?;
+    } else {
+        let total: usize = data.values().map(Vec::len).sum();
+        writeln!(output, "{} categories · {} commands\n", data.len(), total)?;
+        let width = data.keys().map(String::len).max().unwrap_or(0);
+        for (category, entries) in &data {
+            writeln!(output, "  {category:width$}  {} commands", entries.len())?;
+        }
+        writeln!(
+            output,
+            "\nView:        cmdnavi <category>\nAdd:         cmdnavi add <category>"
+        )?;
+    }
+    writeln!(
+        output,
+        "Browse:      cmdnavi --browse\nSearch:      cmdnavi --search <text>\nHelp:        cmdnavi --help"
+    )?;
+    Ok(())
+}
+
+pub fn search(path: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(Error(
+            "search text is empty.\nTry `cmdnavi --search docker`.".into(),
+        ));
+    }
+    let needle = query.to_lowercase();
+    let data = config::load(path)?;
+    let mut count = 0;
+    for (category, entries) in &data {
+        let matches: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                category.to_lowercase().contains(&needle)
+                    || entry.command.to_lowercase().contains(&needle)
+                    || entry.description.to_lowercase().contains(&needle)
+            })
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        writeln!(output, "[{category}]\n")?;
+        for entry in matches {
+            write_entry(output, entry)?;
+            writeln!(output)?;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        writeln!(
+            output,
+            "No matches for \"{query}\".\nTry a shorter keyword or run `cmdnavi list` to see your categories."
+        )?;
+    } else {
+        writeln!(output, "{count} matching commands.")?;
     }
     Ok(())
 }
@@ -110,41 +255,7 @@ pub fn add(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<()> {
-    checked_category(category)?;
-    write!(output, "Command: ")?;
-    output.flush()?;
-    let command = read_line(input)?;
-    if command.trim().is_empty() {
-        return Err(Error(
-            "the command was not added because command is empty.\nEnter the command text you want to save and try again."
-                .into(),
-        ));
-    }
-    write!(output, "Description: ")?;
-    output.flush()?;
-    let description = read_line(input)?;
-    if description.trim().is_empty() {
-        return Err(Error(
-            "the command was not added because description is empty.\nEnter a short explanation of what the command does and try again."
-                .into(),
-        ));
-    }
-    let created = config::update(path, |data| {
-        let created = !data.contains_key(category);
-        data.entry(category.into()).or_default().push(CommandEntry {
-            command,
-            description,
-        });
-        Ok(created)
-    })?;
-    if created {
-        writeln!(
-            output,
-            "Category \"{category}\" does not exist.\nCreated category \"{category}\"."
-        )?;
-    }
-    writeln!(output, "Added command to \"{category}\".")?;
-    Ok(())
+    crate::interaction::add(path, category, input, output)
 }
 
 pub fn remove(
@@ -176,23 +287,36 @@ pub fn remove(
             entry.description
         )?;
     }
-    write!(output, "Select item to remove: ")?;
-    output.flush()?;
-    let selection = read_line(input)?.trim().parse::<usize>().map_err(|_| {
-            Error("nothing was removed because the selection is not a number.\nEnter one of the item numbers shown above.".into())
-    })?;
-    if selection == 0 || selection > entries.len() {
-        return Err(Error(format!(
-            "nothing was removed because {selection} is outside the available range (1-{}).\nEnter a number between 1 and {}.",
-            entries.len(),
+    let selection = loop {
+        write!(
+            output,
+            "Select item to remove (1-{}, Enter or q to cancel): ",
             entries.len()
-        )));
-    }
+        )?;
+        output.flush()?;
+        let selection = read_line(input)?;
+        let selection = selection.trim();
+        if selection.is_empty() || selection.eq_ignore_ascii_case("q") {
+            writeln!(output, "Cancelled.")?;
+            return Ok(());
+        }
+        match selection.parse::<usize>() {
+            Ok(number) if (1..=entries.len()).contains(&number) => break number,
+            _ => writeln!(
+                output,
+                "Choose a number between 1 and {}, or Enter to cancel.",
+                entries.len()
+            )?,
+        }
+    };
     let command = entries[selection - 1].command.clone();
     write!(output, "Remove \"{command}\"? [y/N]: ")?;
     output.flush()?;
     let confirmation = read_line(input)?;
-    if !confirmation.eq_ignore_ascii_case("y") {
+    if !matches!(
+        confirmation.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ) {
         writeln!(output, "Cancelled.")?;
         return Ok(());
     }
@@ -213,7 +337,7 @@ pub fn remove(
     Ok(())
 }
 
-fn read_line(input: &mut dyn BufRead) -> Result<String> {
+pub(crate) fn read_line(input: &mut dyn BufRead) -> Result<String> {
     let mut value = String::new();
     if input.read_line(&mut value)? == 0 {
         return Err(Error(
@@ -290,7 +414,7 @@ mod tests {
         let path = dir.path().join("config.yaml");
         let mut input = Cursor::new("");
 
-        let missing = run(&["add".into()], &path, &mut input, &mut Vec::new())
+        let missing = run(&["remove".into()], &path, &mut input, &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(missing.contains("needs a category"));

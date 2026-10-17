@@ -10,13 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const FULL_EDIT_TEMPLATE: &str = "# cmdnavi configuration\n\
 # Add a category and command by removing the leading '#' characters.\n\
-# Both command and description are required.\n\
+# Command is required; description is optional.\n\
 # network:\n\
 #   - command: ip addr\n\
 #     description: IPアドレスを確認する\n";
 
 const CATEGORY_EDIT_TEMPLATE: &str = "# Add a command by removing the leading '#' characters.\n\
-# Both command and description are required.\n\
+# Command is required; description is optional.\n\
 # - command: ip addr\n\
 #   description: IPアドレスを確認する\n";
 
@@ -26,23 +26,30 @@ pub trait Editor {
 
 pub struct ExternalEditor;
 
+const DEFAULT_EDITOR: &str = if cfg!(windows) { "notepad.exe" } else { "vi" };
+
 impl Editor for ExternalEditor {
     fn edit(&self, path: &Path) -> Result<()> {
         let specification = env::var("VISUAL")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| "vi".into());
-        let mut parts = shell_words::split(&specification)
+            .unwrap_or_else(|| DEFAULT_EDITOR.into());
+        // An existing executable path may contain spaces and Windows backslashes.
+        let mut parts = if Path::new(&specification).is_file() {
+            Ok(vec![specification.clone()])
+        } else {
+            shell_words::split(&specification)
+        }
             .map_err(|e| {
                 Error(format!(
-                    "the editor setting is invalid.\nCorrect $VISUAL or $EDITOR, or unset it to use vi.\n\nTechnical message: {e}"
+                    "the editor setting is invalid.\nCorrect $VISUAL or $EDITOR, or unset it to use {DEFAULT_EDITOR}.\n\nTechnical message: {e}"
                 ))
             })?;
         if parts.is_empty() {
-            return Err(Error(
-                "no editor command was provided.\nUnset $VISUAL or $EDITOR to use vi.".into(),
-            ));
+            return Err(Error(format!(
+                "no editor command was provided.\nUnset $VISUAL or $EDITOR to use {DEFAULT_EDITOR}."
+            )));
         }
         let program = parts.remove(0);
         let status = Command::new(&program)
@@ -339,7 +346,7 @@ mod tests {
             let call = self.calls.get();
             self.calls.set(call + 1);
             if call == 0 {
-                fs::write(path, "- command: ip addr\n")?;
+                fs::write(path, "- command: \"\"\n")?;
             } else {
                 fs::write(path, "- command: ip addr\n  description: show IP\n")?;
             }
@@ -473,11 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn a_command_without_a_description_does_not_create_a_category() {
+    fn an_empty_command_does_not_create_a_category() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
 
-        let error = edit_category(&path, "network", &ReplacingEditor("- command: ip addr\n"))
+        let error = edit_category(&path, "network", &ReplacingEditor("- command: \"\"\n"))
             .unwrap_err()
             .to_string();
 
@@ -532,7 +539,7 @@ mod tests {
         edit_category_interactive(
             &path,
             "network",
-            &ReplacingEditor("- command: ip addr\n"),
+            &ReplacingEditor("- command: \"\"\n"),
             &mut input,
             &mut output,
         )

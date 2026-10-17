@@ -7,6 +7,7 @@ pub type Config = BTreeMap<String, Vec<CommandEntry>>;
 #[serde(deny_unknown_fields)]
 pub struct CommandEntry {
     pub command: String,
+    #[serde(default)]
     pub description: String,
 }
 
@@ -14,9 +15,6 @@ impl CommandEntry {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.command.trim().is_empty() {
             return Err("command must not be empty");
-        }
-        if self.description.trim().is_empty() {
-            return Err("description must not be empty");
         }
         Ok(())
     }

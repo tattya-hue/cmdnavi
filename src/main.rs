@@ -4,8 +4,16 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = cmdnavi::config::config_path().and_then(|path| {
         let stdin = io::stdin();
-        let mut input = stdin.lock();
         let stdout = io::stdout();
+        let terminal = stdin.is_terminal() && stdout.is_terminal()
+            && std::env::var("TERM").as_deref() != Ok("dumb");
+        if args == ["--browse"] || (args.is_empty() && terminal) {
+            if !terminal {
+                return Err(cmdnavi::Error("Interactive browsing needs a terminal. Use `cmdnavi --search <text>` or `cmdnavi <category>` instead.".into()));
+            }
+            return cmdnavi::browser::run(&path);
+        }
+        let mut input = stdin.lock();
         let mut output = stdout.lock();
         cmdnavi::cli::run(&args, &path, &mut input, &mut output)
     });

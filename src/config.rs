@@ -10,7 +10,18 @@ pub fn config_path() -> Result<PathBuf> {
     if let Some(base) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(base).join("cmdnavi/config.yaml"));
     }
-    let home = env::var_os("HOME")
+    #[cfg(windows)]
+    {
+        let base = env::var_os("APPDATA").filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("USERPROFILE").filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join("AppData/Roaming")))
+            .ok_or_else(|| Error("The configuration location could not be determined. Set APPDATA or XDG_CONFIG_HOME.".into()))?;
+        Ok(base.join("cmdnavi/config.yaml"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
             Error(
@@ -18,7 +29,8 @@ pub fn config_path() -> Result<PathBuf> {
                     .into(),
             )
         })?;
-    Ok(PathBuf::from(home).join(".config/cmdnavi/config.yaml"))
+        Ok(PathBuf::from(home).join(".config/cmdnavi/config.yaml"))
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config> {

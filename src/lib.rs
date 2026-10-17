@@ -23,3 +23,7 @@ impl From<std::io::Error> for Error {
         Self(error.to_string())
     }
 }
+
+pub mod browser;
+pub mod clipboard;
+pub mod interaction;
