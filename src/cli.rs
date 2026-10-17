@@ -31,6 +31,8 @@ Options:
 
 An item is a 1-based number or an exact saved command, quoted if it contains spaces.
 Tab completion is context-specific; description/search fields have no command completion.
+Interactive add: filter categories; /back edits the command, /category changes its category at the description prompt.
+Category names accept Japanese and other letters, digits, '_' and '-'.
 Use `cmdnavi --completions bash` to print the Bash integration; see README for setup.
 ";
 
@@ -51,7 +53,38 @@ pub fn run_with_terminal(
 ) -> Result<()> {
     dispatch(args, path, &mut Session::new(input, output, terminal))
 }
+/// Handle commands that do not read or write user configuration.
+pub fn run_metadata(args: &[String], output: &mut dyn Write) -> Option<Result<()>> {
+    let strings: Vec<_> = args.iter().map(String::as_str).collect();
+    match strings.as_slice() {
+        ["--completions", _] | ["-h" | "--help" | "help" | "-v" | "--version" | "version"] => {}
+        [action, "-h" | "--help"] if completion::ACTIONS.contains(action) => {}
+        _ => return None,
+    }
+    Some((|| {
+        match strings.as_slice() {
+            ["--completions", shell] => {
+                let script = completion::script(shell)
+                    .ok_or_else(|| Error("Choose bash, zsh, fish or powershell.".into()))?;
+                write!(output, "{script}")?;
+            }
+            ["-h" | "--help" | "help"] => write!(output, "{HELP}")?,
+            ["-v" | "--version" | "version"] => {
+                writeln!(output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
+            }
+            [action, "-h" | "--help"] if completion::ACTIONS.contains(action) => {
+                action_help(action, output)?
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    })())
+}
+
 fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
+    if let Some(result) = run_metadata(args, s.output) {
+        return result;
+    }
     let strings: Vec<_> = args.iter().map(String::as_str).collect();
     match strings.as_slice() {
         [] => overview(path, s.output)?,
@@ -74,8 +107,30 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
             }
             let prefix = words.get(position).map(String::as_str).unwrap_or("");
             let data = config::load(path).unwrap_or_default();
-            let values =
-                completion::candidates(&data, &completion::context(&words, position), prefix);
+            let context = completion::context(&words, position);
+            let mut values = completion::candidates(&data, &context, prefix);
+            if *shell == "fish" {
+                // Fish uses TAB as the candidate/description separator even with NUL records.
+                // Reference existing items by index rather than insert a truncated command.
+                values.retain_mut(|item| {
+                    if !item.value.contains('\t') {
+                        return true;
+                    }
+                    if let completion::Context::Items(category) = &context
+                        && let Some(entries) = data.get(category)
+                        && let Ok(index) = interaction::resolve_item(entries, &item.value)
+                    {
+                        item.description = format!(
+                            "{} · {}",
+                            crate::session::visible(&item.value),
+                            item.description
+                        );
+                        item.value = format!("#{}", index + 1);
+                        return true;
+                    }
+                    false
+                });
+            }
             if *shell == "powershell" {
                 let values: Vec<_> = values.iter().map(|c| serde_json::json!({"value":c.value,"description":crate::session::visible(&c.description),"insert":completion::shell_quote(&c.value,shell)})).collect();
                 writeln!(
@@ -106,18 +161,6 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
                     }
                 }
             }
-        }
-        ["--completions", shell] => {
-            let script = completion::script(shell)
-                .ok_or_else(|| Error("Choose bash, zsh, fish or powershell.".into()))?;
-            write!(s.output, "{script}")?;
-        }
-        ["-h" | "--help" | "help"] => write!(s.output, "{HELP}")?,
-        ["-v" | "--version" | "version"] => {
-            writeln!(s.output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
-        }
-        [action, "-h" | "--help"] if completion::ACTIONS.contains(action) => {
-            action_help(action, s.output)?
         }
         ["--config-path"] => writeln!(s.output, "{}", path.display())?,
         ["--undo"] => {
@@ -263,7 +306,7 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
 fn action_help(action: &str, output: &mut dyn Write) -> Result<()> {
     let text = match action {
         "add" => {
-            "cmdnavi add [category] [\"command\"] [\"description\"]\nChoose/create a category; Tab completes categories only here. The command field completes saved commands in that category. Description has no completion. Enter skips the description; Ctrl+C or /cancel cancels.\nMultiline paste is supported in a terminal. In scripts, pass quoted arguments. Omitting description preserves an existing description."
+            "cmdnavi add [category] [\"command\"] [\"description\"]\nChoose/create a category; Tab completes categories only here. The command field completes saved commands in that category. Description has no completion. Enter skips the description; Ctrl+C or /cancel cancels.\nIn a terminal, filter categories by any part of the name, then use Up/Down and Enter. At the description prompt, /back edits the command and /category changes its category without losing the command.\nMultiline paste is supported in a terminal. In scripts, pass quoted arguments. Omitting description preserves an existing description."
         }
         "edit" => {
             "cmdnavi edit [category] [item]\nWithout an item, edit YAML using VISUAL/EDITOR. With a number or quoted saved command, edit that item with the current values prefilled. Tab completes items only after the category. Ctrl+C or /cancel cancels."

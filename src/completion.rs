@@ -89,11 +89,32 @@ pub fn candidates(data: &Config, context: &Context, prefix: &str) -> Vec<Candida
             .collect(),
         Context::Commands(category) | Context::Items(category) => {
             let mut values = Vec::new();
-            for (i, entry) in data.get(category).into_iter().flatten().enumerate() {
-                values.push(plain(
-                    &entry.command,
-                    &format!("#{} · {}", i + 1, entry.description),
-                ));
+            let entries = data.get(category).map(Vec::as_slice).unwrap_or_default();
+            let mut counts = std::collections::HashMap::new();
+            for entry in entries {
+                *counts.entry(entry.command.as_str()).or_insert(0usize) += 1;
+            }
+            for (i, entry) in entries.iter().enumerate() {
+                // Numeric selectors and duplicated commands need an explicit item number.
+                let selector = if matches!(context, Context::Items(_))
+                    && (entry
+                        .command
+                        .strip_prefix('#')
+                        .unwrap_or(&entry.command)
+                        .parse::<usize>()
+                        .is_ok()
+                        || counts[entry.command.as_str()] > 1)
+                {
+                    format!("#{}", i + 1)
+                } else {
+                    entry.command.clone()
+                };
+                let description = if selector == entry.command {
+                    format!("#{} · {}", i + 1, entry.description)
+                } else {
+                    format!("#{} · {} · {}", i + 1, entry.command, entry.description)
+                };
+                values.push(plain(&selector, &description));
                 if matches!(context, Context::Items(_)) {
                     values.push(plain(&(i + 1).to_string(), &entry.command));
                 }
@@ -101,7 +122,14 @@ pub fn candidates(data: &Config, context: &Context, prefix: &str) -> Vec<Candida
             values
         }
     };
-    values.retain(|item| item.value.starts_with(prefix));
+    values.retain(|item| {
+        item.value.starts_with(prefix)
+            || matches!(context, Context::Items(category) if item.value.strip_prefix('#')
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| data.get(category)?.get(i))
+                .is_some_and(|entry| entry.command.starts_with(prefix)))
+    });
     let mut seen = std::collections::HashSet::new();
     values.retain(|item| seen.insert(item.value.clone()));
     values

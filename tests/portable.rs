@@ -68,3 +68,73 @@ fn native_config_location_works_without_xdg() {
     let path = dir.path().join(".config/cmdnavi/config.yaml");
     assert!(path.exists());
 }
+
+#[test]
+fn japanese_categories_work_for_registration_completion_renaming_and_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    assert!(
+        run(base, &["add", "障害調査", "ip addr", "調査用"])
+            .status
+            .success()
+    );
+    let output = run(
+        base,
+        &["--complete", "powershell", "1", "--", "edit", "障害"],
+    );
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("障害調査")
+    );
+    assert!(
+        run(base, &["--rename-category", "障害調査", "作業メモ"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        String::from_utf8(run(base, &["--print", "作業メモ", "1"]).stdout).unwrap(),
+        "ip addr"
+    );
+    assert!(run(base, &["--undo"]).status.success());
+    assert_eq!(
+        String::from_utf8(run(base, &["--print", "障害調査", "1"]).stdout).unwrap(),
+        "ip addr"
+    );
+}
+
+#[test]
+fn help_version_and_completion_scripts_work_without_a_config_location() {
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["add", "--help"],
+        vec!["list", "-h"],
+        vec!["--completions", "fish"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cmdnavi"))
+            .args(&args)
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
+            .env_remove("USERPROFILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty());
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_cmdnavi"))
+        .arg("--config-path")
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("APPDATA")
+        .env_remove("USERPROFILE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}

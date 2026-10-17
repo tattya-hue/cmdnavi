@@ -105,6 +105,85 @@ fn completion_reads_newly_saved_categories_without_writing_data() {
     assert!(run(&path, &args, "").unwrap().contains("docker"));
     assert!(!path.with_extension("yaml.undo").exists());
 }
+
+#[test]
+fn ambiguous_commands_complete_to_selectors_that_identify_the_right_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let commands = ["echo", "99", "echo", "#1", "2"];
+    let data = Config::from([(
+        "notes".into(),
+        commands
+            .iter()
+            .map(|command| CommandEntry {
+                command: (*command).into(),
+                description: String::new(),
+            })
+            .collect(),
+    )]);
+    config::save(&path, &data).unwrap();
+    for (prefix, expected) in [
+        ("99", "#2"),
+        ("echo", "#1"),
+        ("echo", "#3"),
+        ("#1", "#4"),
+        ("2", "#5"),
+    ] {
+        let candidates = completion::candidates(&data, &Context::Items("notes".into()), prefix);
+        assert!(
+            candidates.iter().any(|c| c.value == expected),
+            "{prefix}: {candidates:?}"
+        );
+        let index = cmdnavi::interaction::resolve_item(&data["notes"], expected).unwrap();
+        assert_eq!(
+            run(&path, &["--print", "notes", expected], "").unwrap(),
+            commands[index]
+        );
+    }
+    assert_eq!(
+        completion::candidates(&data, &Context::Commands("notes".into()), "99")[0].value,
+        "99"
+    );
+}
+
+#[test]
+fn fish_tabbed_items_complete_by_index_without_truncating_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    run(&path, &["add", "notes", "printf\tvalue", "tabbed"], "").unwrap();
+    let output = run(
+        &path,
+        &[
+            "--complete",
+            "fish",
+            "2",
+            "--",
+            "--print",
+            "notes",
+            "printf",
+        ],
+        "",
+    )
+    .unwrap();
+    let records: Vec<_> = output.split('\0').filter(|r| !r.is_empty()).collect();
+    assert_eq!(records.len(), 1);
+    let (selector, description) = records[0].split_once('\t').unwrap();
+    assert_eq!(selector, "#1");
+    assert!(!description.contains('\t'));
+    assert_eq!(
+        run(&path, &["--print", "notes", selector], "").unwrap(),
+        "printf\tvalue"
+    );
+    assert!(
+        run(
+            &path,
+            &["--complete", "fish", "2", "--", "add", "notes", "printf"],
+            ""
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
 #[test]
 fn omitted_duplicate_description_is_noninteractive_and_preserves_saved_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -117,6 +196,17 @@ fn omitted_duplicate_description_is_noninteractive_and_preserves_saved_text() {
             .contains("Already saved")
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn form_navigation_words_stay_literal_in_arguments_and_piped_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    run(&path, &["add", "notes"], "echo script\n/back\n").unwrap();
+    run(&path, &["add", "notes", "echo args", "/category"], "").unwrap();
+    let data = config::load(&path).unwrap();
+    assert_eq!(data["notes"][0].description, "/back");
+    assert_eq!(data["notes"][1].description, "/category");
 }
 #[test]
 fn unsafe_input_and_extra_lines_are_rejected_before_saving() {

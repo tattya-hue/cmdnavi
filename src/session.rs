@@ -1,5 +1,5 @@
 //! Interactive line editing is explicitly enabled by the executable, never by unit-test stdin.
-use crate::completion::{self, Candidate, Context};
+use crate::completion::{self, Context};
 use crate::{Error, Result};
 use rustyline::{
     Editor, Helper,
@@ -12,7 +12,10 @@ use rustyline::{
 };
 use std::io::{BufRead, Write};
 
-struct Suggestions(Vec<Candidate>);
+struct Suggestions {
+    data: crate::model::Config,
+    context: Context,
+}
 impl Helper for Suggestions {}
 impl Highlighter for Suggestions {}
 impl Hinter for Suggestions {
@@ -27,20 +30,26 @@ impl Completer for Suggestions {
         pos: usize,
         _: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        if pos != line.len() {
-            return Ok((pos, Vec::new()));
-        }
         Ok((
             0,
-            self.0
-                .iter()
-                .filter(|c| c.value.starts_with(line))
+            completion::candidates(&self.data, &self.context, &line[..pos])
+                .into_iter()
                 .map(|c| Pair {
                     display: format!("{}  {}", visible(&c.value), visible(&c.description)),
                     replacement: c.value.clone(),
                 })
                 .collect(),
         ))
+    }
+    fn update(
+        &self,
+        line: &mut rustyline::line_buffer::LineBuffer,
+        _start: usize,
+        elected: &str,
+        changes: &mut rustyline::Changeset,
+    ) {
+        // Suggestions represent the entire field, including text after the cursor.
+        line.replace(0..line.len(), elected, changes);
     }
 }
 
@@ -83,7 +92,10 @@ impl<'a> Session<'a> {
             for item in &suggestions {
                 let _ = editor.add_history_entry(&item.value);
             }
-            editor.set_helper(Some(Suggestions(suggestions)));
+            editor.set_helper(Some(Suggestions {
+                data: data.clone(),
+                context,
+            }));
             match editor.readline_with_initial(label, (initial, "")) {
                 Ok(value) => value,
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => {

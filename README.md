@@ -7,13 +7,13 @@ Windows・Linux向けCLIツールです。登録されたコマンドを実行�
 
 ### 実行ファイルをダウンロード（推奨）
 
-[GitHub Releases](https://github.com/tattya-hue/cmdnavi/releases/tag/v1.1.0)のAssetsから取得できます。
+[GitHub Releases](https://github.com/tattya-hue/cmdnavi/releases/tag/v1.2.0)のAssetsから取得できます。
 Rustのインストールは不要です。
 
 | OS | ダウンロードするファイル |
 | --- | --- |
-| Windows x64 | `cmdnavi-v1.1.0-x86_64-pc-windows-msvc.zip` |
-| Linux x86_64（glibc 2.35以降、Ubuntu 22.04以降など） | `cmdnavi-v1.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `cmdnavi-v1.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64（glibc 2.35以降、Ubuntu 22.04以降など） | `cmdnavi-v1.2.0-x86_64-unknown-linux-gnu.tar.gz` |
 
 WindowsではZIPを展開し、そのフォルダでPowerShellを開いて実行します。
 
@@ -25,8 +25,8 @@ WindowsではZIPを展開し、そのフォルダでPowerShellを開いて実行
 Linuxでは展開して実行します。
 
 ```sh
-tar -xzf cmdnavi-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd cmdnavi-v1.1.0-x86_64-unknown-linux-gnu
+tar -xzf cmdnavi-v1.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd cmdnavi-v1.2.0-x86_64-unknown-linux-gnu
 ./cmdnavi --version
 ./cmdnavi
 ```
@@ -47,7 +47,7 @@ Windowsでは`Get-FileHash <ZIPファイル名> -Algorithm SHA256`の値を`.sha
 本コマンドはソースをGitHubから直接取得してインストールします。
 
 ```sh
-cargo install --git https://github.com/tattya-hue/cmdnavi.git --tag v1.1.0 --locked
+cargo install --git https://github.com/tattya-hue/cmdnavi.git --tag v1.2.0 --locked
 ```
 
 実行ファイルは通常`~/.cargo/bin/cmdnavi`へ配置されます。インストール後に
@@ -61,7 +61,7 @@ cmdnavi --version
 更新する場合は、新しいタグを指定して`--force`を付けます。
 
 ```sh
-cargo install --git https://github.com/tattya-hue/cmdnavi.git --tag v1.1.0 --locked --force
+cargo install --git https://github.com/tattya-hue/cmdnavi.git --tag v1.2.0 --locked --force
 ```
 
 アンインストール：
@@ -112,13 +112,14 @@ cmdnavi --version
 | 項目を移動 / カテゴリ名を変更 | Ctrl+G / Ctrl+N |
 | 直前の変更を取り消す・やり直す | Ctrl+Z |
 | 再読み込み（外部からの更新は自動反映） | Ctrl+R |
-| 検索文字を消す | Ctrl+U |
+| カーソル直前の検索語を消す / 検索全体を消す | Ctrl+W / Ctrl+U |
 | 長いコマンド・説明をスクロール | PageUp / PageDown |
 | ヘルプ・エラー全文を読む | F1（↑↓でスクロール） |
 | 終了する | Esc / Ctrl+C |
 
 対話画面では空白で区切った複数の検索語すべてを含む項目を表示します。
-コマンドと説明は詳細欄で折り返して表示し、日本語の文字幅も考慮します。
+一致した箇所には下線が付き、コマンドと説明は詳細欄で折り返して表示します。日本語の文字幅も考慮します。
+見つからない場合はCtrl+Wで検索語を1つ減らすか、Ctrl+Uで検索をやり直せます。
 `NO_COLOR`を設定すると色を使いません。画面が小さい場合は拡大方法を案内します。
 Windowsのコピー機能は標準のWindows PowerShellを使用します。
 WSLではWindows PowerShellへのフォールバックも使います。コピー処理中も対話画面は操作可能です。
@@ -128,9 +129,17 @@ LinuxのコピーにはWaylandで`wl-copy`（wl-clipboard）、X11で`xclip`ま�
 出力をパイプやファイルへ送る場合や`TERM=dumb`の場合は、引数なしでも
 カテゴリと件数の通常表示になります。`cmdnavi network`や`cmdnavi list`も従来どおり使えます。
 
-`cmdnavi add`では既存カテゴリの`#番号`か新しい名前を入力します。
-Enterだけなら`general`に保存します。コマンドが空欄ならその場で入力し直せます。
-説明はEnterで省略でき、入力中は`/cancel`で中止できます。
+`cmdnavi add`のカテゴリ選択では、名前の一部（日本語も可）を入力すると候補と登録件数を絞り込めます。
+↑↓で選んでEnter、Tabで選択中の名前を入力欄へ反映します。
+新しい名前は「Create」の行を選ぶか、名前を入力してCtrl+Nで選択します。Esc / Ctrl+Cで中止できます。
+カテゴリはコマンドの保存時に作成されるため、途中で中止しても空のカテゴリは残りません。
+標準入力をパイプした場合は従来の名前・`#番号`入力になり、Enterだけなら`general`に保存します。
+
+登録フォームでは、説明の前に保存先とコマンド本文を表示します。
+説明欄で`/back`を入力すると本文を保持して修正でき、`/category`なら本文を保持して保存先を選び直せます。
+カテゴリ選択だけをキャンセルした場合は、元の保存先で入力を続けます。
+コマンドが空欄ならその場で入力し直せます。説明はEnterで省略でき、`/cancel`で中止できます。
+`/back`・`/category`は対話フォームの説明欄だけの操作です。引数・パイプ入力では通常の説明として保存します。
 同じカテゴリに同じコマンドがあれば重複追加しません。説明の省略時は既存の説明を保持し、
 明示的に説明を変更した場合だけ更新を確認します。
 
@@ -153,7 +162,10 @@ Enterで確定し、説明を消す場合は入力欄を空にするか`/clear`�
 ```text
 $ cmdnavi add network
 Add to [network] · Tab completes saved commands · Ctrl+C or /cancel cancels
+Description: /back edits the command; /category changes the category. Input is kept when you go back.
 Command: ip addr
+Save in [network]:
+  ip addr
 Description (optional, Enter to skip): IPアドレスを確認する
 Created category "network".
 Saved command in [network].
@@ -170,7 +182,7 @@ ip addr
   IPアドレスを確認する
 ```
 
-カテゴリ名には英数字、`_`、`-`を使用できます。`add`、`edit`、`list`、
+カテゴリ名には日本語などの文字、数字、`_`、`-`を使用できます（例: `障害調査`、`作業メモ`）。空白や、それ以外の記号は使えません。`add`、`edit`、`list`、
 `remove`、`help`、`version`は予約語です。
 
 ## 補完・入力編集
@@ -360,8 +372,8 @@ python3 tests/usability_smoke.py # 入力編集・貼り付け・Bash/Zsh/Fish�
 3. そのコミットにタグを付けてpushします。タグはCargoのバージョンと一致させます。
 
 ```sh
-git tag -a v1.1.0 -m "Release v1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "Release v1.2.0"
+git push origin v1.2.0
 ```
 
 リポジトリでGitHub Actionsを有効にしてください。公開ジョブは`contents: write`権限の

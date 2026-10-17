@@ -54,6 +54,14 @@ pub fn edit_entry(
 
 pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Option<String>> {
     let data = config::load(path)?;
+    if session.terminal {
+        session.output.flush()?;
+        let selected = crate::category_picker::choose(&data)?;
+        if selected.is_none() {
+            writeln!(session.output, "Cancelled.")?;
+        }
+        return Ok(selected);
+    }
     let categories: Vec<_> = data.keys().collect();
     writeln!(
         session.output,
@@ -109,36 +117,74 @@ pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Op
 
 pub fn add_with(path: &Path, category: &str, session: &mut Session<'_>) -> Result<()> {
     validate_category(category).map_err(Error)?;
-    let data = config::load(path)?;
+    let mut category = category.to_owned();
+    let mut command = String::new();
     writeln!(
         session.output,
         "Add to [{category}] · Tab completes saved commands · Ctrl+C or /cancel cancels"
     )?;
-    let command = loop {
-        let Some(value) =
-            session.ask("Command: ", "", Context::Commands(category.into()), &data)?
-        else {
-            return Ok(());
-        };
-        if !value.trim().is_empty() {
-            break value;
+    if session.terminal {
+        writeln!(
+            session.output,
+            "Description: /back edits the command; /category changes the category. Input is kept when you go back."
+        )?;
+    }
+    loop {
+        let data = config::load(path)?;
+        loop {
+            let initial = if session.terminal {
+                command.as_str()
+            } else {
+                ""
+            };
+            let Some(value) = session.ask(
+                "Command: ",
+                initial,
+                Context::Commands(category.clone()),
+                &data,
+            )?
+            else {
+                return Ok(());
+            };
+            if !value.trim().is_empty() {
+                command = value;
+                break;
+            }
+            writeln!(session.output, "Enter a command to save.")?;
         }
-        writeln!(session.output, "Enter a command to save.")?;
-    };
-    let Some(description) = session.plain("Description (optional, Enter to skip): ")? else {
-        return Ok(());
-    };
-    session.finish_form()?;
-    save_entry_with(
-        path,
-        category,
-        CommandEntry {
-            command,
-            description: description.clone(),
-        },
-        !description.is_empty(),
-        session,
-    )
+        loop {
+            if session.terminal {
+                writeln!(session.output, "Save in [{category}]:")?;
+                for line in command.lines() {
+                    writeln!(session.output, "  {line}")?;
+                }
+            }
+            let Some(description) = session.plain("Description (optional, Enter to skip): ")?
+            else {
+                return Ok(());
+            };
+            if session.terminal && description == "/back" {
+                break;
+            }
+            if session.terminal && description == "/category" {
+                if let Some(selected) = choose_category_with(path, session)? {
+                    category = selected;
+                }
+                continue;
+            }
+            session.finish_form()?;
+            return save_entry_with(
+                path,
+                &category,
+                CommandEntry {
+                    command,
+                    description: description.clone(),
+                },
+                !description.is_empty(),
+                session,
+            );
+        }
+    }
 }
 
 pub fn save_entry_with(

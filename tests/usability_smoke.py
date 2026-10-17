@@ -66,6 +66,7 @@ def run(root):
         return cli('--print', category, '1')
     cli('add', 'network', 'ip addr', 'IPアドレス')
     cli('add', 'git', 'git status')
+    cli('add', 'numeric', '99')
     sentinel = root / 'never-evaluated'
     dangerous = f"printf '%s' \"$(touch {sentinel})\""
     cli('add', 'shell', dangerous)
@@ -84,6 +85,47 @@ def run(root):
         t.close()
         raise
     assert cli('--print', 'network', '2') == 'ip addZr'
+
+    # Completion at a middle cursor replaces the field, without duplicating its suffix.
+    t = Terminal([BINARY, 'add'], env)
+    try:
+        t.expect('Category (name')
+        t.send('network\x01\x1b[C\x1b[C\x1b[C\t\n')
+        t.expect('Command:')
+        t.send('git stajunk\x01' + '\x1b[C' * 7 + '\t\n')
+        # No git candidates in network: the field must remain unchanged.
+        t.expect('Description (optional')
+        t.send('\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert cli('--print', 'network', '3') == 'git stajunk'
+
+    t = Terminal([BINARY, 'add', 'git'], env)
+    try:
+        t.expect('Command:')
+        t.send('git stajunk\x01' + '\x1b[C' * 7 + '\t\n')
+        t.expect('Description (optional')
+        t.send('\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert cli('--show', 'git').count('git status') == 1
+
+    # Numeric command text completes to a real item reference in the picker.
+    t = Terminal([BINARY, 'remove', 'numeric'], env)
+    try:
+        t.expect('Select item')
+        t.send('99\t\n')
+        t.expect('Remove "99"?')
+        t.send('n\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('numeric') == '99'
 
     # Bracketed multiline paste stays in the command field until Enter accepts it.
     multiline = 'echo first\necho 日本語'
@@ -124,6 +166,66 @@ def run(root):
         raise
     assert 'cancelled' not in cli('list').splitlines()
 
+    # Substring category selection and going back keep the command until final save.
+    t = Terminal([BINARY, 'add'], env)
+    try:
+        t.expect('Category (name')
+        t.send('WORK')
+        t.expect('[network] (3 commands)')
+        t.send('\n')
+        t.expect('Command:')
+        t.send('echo original\n')
+        t.expect('Save in [network]:')
+        t.expect('Description (optional')
+        t.send('/back\n')
+        t.expect('Command:')
+        t.send('\x05 amended\n')
+        t.expect('Description (optional')
+        t.send('/category\n')
+        t.expect('Category (name')
+        t.send('作業メモ\n')
+        t.expect('Save in [作業メモ]:')
+        t.expect('Description (optional')
+        assert '作業メモ' not in cli('list').splitlines()
+        t.send('/category\n')
+        t.expect('Category (name')
+        t.send('\x1b')
+        t.expect('Save in [作業メモ]:')
+        t.expect('Description (optional')
+        t.send('memo\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('作業メモ') == 'echo original amended'
+    assert 'WORK' not in cli('list').splitlines()
+
+    # A partial existing match can still be chosen as an explicit new category.
+    t = Terminal([BINARY, 'add'], env)
+    try:
+        t.expect('Category (name')
+        t.send('work\x0e')
+        t.expect('Command:')
+        t.send('echo new\n')
+        t.expect('Description (optional')
+        t.send('\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('work') == 'echo new'
+
+    # Cancelling the category chooser leaves no partial category behind.
+    t = Terminal([BINARY, 'add'], env)
+    try:
+        t.expect('Category (name')
+        t.send('未保存\x1b')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert '未保存' not in cli('list').splitlines()
+
     t = Terminal([BINARY], env)
     try:
         t.expect('F1 Help')
@@ -131,6 +233,11 @@ def run(root):
         t.expect('Search > ip')
         cli('add', 'network', 'ip link', 'external update')
         t.expect('3 matches')
+        t.send(' nonsense')
+        t.expect('No matches. Ctrl+W')
+        t.send('\x17')
+        t.expect('3 matches')
+        t.expect('\x1b[4mip\x1b[24m')
         # A slow helper cannot trap the browser; quitting is immediate.
         helper = root / 'wl-copy'
         helper.write_text('#!/bin/sh\nsleep 4\ncat >/dev/null\n')
@@ -163,11 +270,17 @@ def run(root):
         t.expect('\x1eREADY> \x1f')
         t.send("_capture(){ printf '\\nCAPTURE:%s:END\\x1f\\n' \"$READLINE_LINE\"; READLINE_LINE=; READLINE_POINT=0; }; bind -x '\"\\C-x\":_capture'\n")
         t.expect('\x1eREADY> \x1f')
-        for typed, expected in [('cmdnavi a\t', 'cmdnavi add '), ('cmdnavi edit net\t', 'cmdnavi edit network '), ('cmdnavi --print network 1\t', 'cmdnavi --print network 1 '), ('cmdnavi --print network ip\\ addr\t', 'cmdnavi --print network '), ('cmdnavi --print network \"ip addr\t', 'cmdnavi --print network '), ("cmdnavi --print network 'ip addr\t", 'cmdnavi --print network ')] :
+        for typed, expected in [('cmdnavi a\t', 'cmdnavi add '), ('cmdnavi edit net\t', 'cmdnavi edit network '), ('cmdnavi edit 作\t', 'cmdnavi edit '), ('cmdnavi --print network 1\t', 'cmdnavi --print network 1 '), ('cmdnavi --print numeric 99\t', 'cmdnavi --print numeric '), ('cmdnavi --print network ip\\ addr\t', 'cmdnavi --print network '), ('cmdnavi --print network \"ip addr\t', 'cmdnavi --print network '), ("cmdnavi --print network 'ip addr\t", 'cmdnavi --print network ')] :
             t.send(typed + '\x18')
             capture = t.expect(':END\x1f').decode(errors='replace')
             line = capture.rsplit('CAPTURE:', 1)[-1].split(':END')[0]
             assert line.startswith(expected), repr(line)
+            if 'edit 作' in typed:
+                decoded = subprocess.check_output(['bash', '-c', "printf '%s\\0' " + line], env=env).split(b'\0')
+                assert decoded[2:-1] == ['作業メモ'.encode()], (line, decoded)
+            if 'numeric 99' in typed:
+                decoded = subprocess.check_output(['bash', '-c', "printf '%s\\0' " + line], env=env).split(b'\0')
+                assert decoded[3:-1] == [b'#1'], (line, decoded)
             if 'ip\\ addr' in typed or '"ip addr' in typed or "'ip addr" in typed:
                 # The inserted command must remain a single shell argument.
                 decoded = subprocess.check_output(['bash', '-c', "printf '%s\\0' " + line], env=env).split(b'\0')
@@ -191,13 +304,16 @@ def run(root):
 
     fish = os.environ.get('CMDNAVI_TEST_FISH') or shutil.which('fish')
     if fish:
+        cli('add', 'tabbed', 'printf\tvalue', 'tabbed command')
         source = "source " + str(ROOT/'completions/cmdnavi.fish') + "; "
         for line, expected, forbidden in [
             ('cmdnavi a', 'add', 'ip addr'),
             ('cmdnavi edit net', 'network', 'ip addr'),
+            ('cmdnavi edit 作', '作業メモ', 'ip addr'),
             ('cmdnavi --print network ip\\ addr', 'ip addr', 'git status'),
             ('cmdnavi add network "ip addr" ', None, 'ip addr'),
             ('cmdnavi --search ', None, 'ip addr'),
+            ('cmdnavi --print tabbed ', '#1', 'printf'),
         ]:
             expression = source + "complete -C '" + line.replace("'", "\\'") + "'"
             result = subprocess.check_output([fish,'--no-config','-c',expression], env=env, text=True)
@@ -212,11 +328,14 @@ def run(root):
             t.expect('\x1eREADY> \x1f')
             t.send("_capture(){ printf '\\nCAPTURE:%s:END\\x1f\\n' \"$BUFFER\"; BUFFER=; CURSOR=0; zle reset-prompt; }; zle -N _capture; bindkey '^X' _capture\n")
             t.expect('\x1eREADY> \x1f')
-            for typed, expected in [('cmdnavi a\t', 'cmdnavi add '), ('cmdnavi edit net\t', 'cmdnavi edit network '), ('cmdnavi --print network ip\\ addr\t', 'cmdnavi --print network '), ('cmdnavi --print network \"ip addr\t', 'cmdnavi --print network '), ("cmdnavi --print network 'ip addr\t", 'cmdnavi --print network '), ('cmdnavi --search ip\t', 'cmdnavi --search ip')]:
+            for typed, expected in [('cmdnavi a\t', 'cmdnavi add '), ('cmdnavi edit net\t', 'cmdnavi edit network '), ('cmdnavi edit 作\t', 'cmdnavi edit '), ('cmdnavi --print network ip\\ addr\t', 'cmdnavi --print network '), ('cmdnavi --print network \"ip addr\t', 'cmdnavi --print network '), ("cmdnavi --print network 'ip addr\t", 'cmdnavi --print network '), ('cmdnavi --search ip\t', 'cmdnavi --search ip')]:
                 t.send(typed + '\x18')
                 capture = t.expect(':END\x1f').decode(errors='replace')
                 line = capture.rsplit('CAPTURE:', 1)[-1].split(':END')[0]
                 assert line.startswith(expected), repr(line)
+                if 'edit 作' in typed:
+                    decoded = subprocess.check_output(['zsh', '-c', "printf '%s\\0' " + line], env=env).split(b'\0')
+                    assert decoded[2:-1] == ['作業メモ'.encode()], (line, decoded)
                 if 'ip\\ addr' in typed or '"ip addr' in typed or "'ip addr" in typed:
                     decoded = subprocess.check_output(['zsh', '-c', "printf '%s\\0' " + line], env=env).split(b'\0')
                     assert decoded[3:-1] == [b'ip addr'], (line, decoded)
@@ -239,4 +358,4 @@ def run(root):
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='cmdnavi-usability-test-') as directory:
         run(Path(directory))
-    print('Usability PTY checks passed: scoped completion, cursor editing, multiline paste, prefill, cancel, refresh, responsive copying, Bash/Zsh insertion.')
+    print('Usability PTY checks passed: category filtering/creation, form back/category navigation, Unicode categories, scoped completion, search highlighting, cursor editing, multiline paste, cancel, refresh, responsive copying, Bash/Zsh/Fish completion.')

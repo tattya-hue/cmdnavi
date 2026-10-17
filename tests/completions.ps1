@@ -10,6 +10,7 @@ try {
     $env:PATH = (Split-Path $Binary) + [IO.Path]::PathSeparator + $env:PATH
     & $Binary add network 'ip addr' 'IP address' | Out-Null
     & $Binary add git 'git status' 'status' | Out-Null
+    & $Binary add numeric '99' 'numeric command' | Out-Null
     . (Join-Path $PSScriptRoot '../completions/cmdnavi.ps1')
     function Matches([string]$Line) {
         @((TabExpansion2 $Line $Line.Length).CompletionMatches | ForEach-Object { $_.CompletionText })
@@ -19,7 +20,9 @@ try {
         @('cmdnavi edit net', 'network'),
         @('cmdnavi --print network ip', "'ip addr'"),
         @('cmdnavi add network ip', "'ip addr'"),
-        @('cmdnavi --move network 1 g', 'git')
+        @('cmdnavi --move network 1 g', 'git'),
+        @('cmdnavi --print numeric 99', "'#1'"),
+        @('cmdnavi add numeric 99', '99')
     )) {
         $result = Matches $case[0]
         if ($result -notcontains $case[1]) { throw "Missing $($case[1]) for $($case[0]): $result" }
@@ -30,6 +33,8 @@ try {
     }
     $sentinel = Join-Path $temp 'never-execute'
     $japanese = -join @([char]0x65e5, [char]0x672c, [char]0x8a9e)
+    & $Binary add $japanese 'pwd' | Out-Null
+    if ((Matches ('cmdnavi edit ' + $japanese.Substring(0, 1))) -notcontains ("'" + $japanese + "'")) { throw 'Unicode category completion failed' }
     $dangerous = "echo '$japanese'; `$(New-Item '$sentinel')"
     & $Binary add shell $dangerous '' | Out-Null
     $result = Matches 'cmdnavi --print shell echo'

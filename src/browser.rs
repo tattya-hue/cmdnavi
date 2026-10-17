@@ -16,9 +16,9 @@ use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-struct Screen;
+pub(crate) struct Screen;
 impl Screen {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
         let screen = Self;
         execute!(
@@ -82,6 +82,16 @@ impl State {
         self.cursor = 0;
         self.changed();
     }
+    fn remove_word(&mut self) {
+        let prefix = self.query[..self.cursor].trim_end_matches(char::is_whitespace);
+        let start = prefix
+            .rfind(char::is_whitespace)
+            .map(|i| i + prefix[i..].chars().next().unwrap().len_utf8())
+            .unwrap_or(0);
+        self.query.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.changed();
+    }
 }
 fn matches<'a>(data: &'a Config, query: &str) -> Vec<(&'a str, usize, &'a CommandEntry)> {
     data.iter()
@@ -98,13 +108,16 @@ fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
-fn reload(path: &Path, data: &mut Config, state: &mut State) {
+fn reload(path: &Path, data: &mut Config, state: &mut State, message: Option<&str>) -> bool {
     let selected = matches(data, &state.query)
         .get(state.selected)
         .map(|(c, _, e)| (c.to_string(), e.command.clone()));
     match config::load(path) {
         Ok(new) => {
             *data = new;
+            if let Some(message) = message {
+                state.message = message.into();
+            }
             if let Some((category, command)) = selected
                 && let Some(i) = matches(data, &state.query)
                     .iter()
@@ -112,11 +125,13 @@ fn reload(path: &Path, data: &mut Config, state: &mut State) {
             {
                 state.selected = i;
             }
+            true
         }
         Err(error) => {
             state.message = format!("Reload failed. Keeping the last readable data.\n{error}");
             state.help = true;
             state.help_offset = 0;
+            false
         }
     }
 }
@@ -130,7 +145,7 @@ pub fn run(path: &Path) -> Result<()> {
     let mut dirty = true;
     loop {
         if known_stamp != stamp(path) {
-            reload(path, &mut data, &mut state);
+            reload(path, &mut data, &mut state, None);
             known_stamp = stamp(path);
             dirty = true;
         }
@@ -187,14 +202,17 @@ pub fn run(path: &Path) -> Result<()> {
                 state.help_offset = 0;
             }
             KeyCode::Char('r') if ctrl => {
-                reload(path, &mut data, &mut state);
+                reload(path, &mut data, &mut state, Some("Reloaded."));
                 known_stamp = stamp(path);
-                state.message = "Reloaded.".into();
             }
             KeyCode::Char('z') if ctrl => match config::undo(path) {
                 Ok(()) => {
-                    reload(path, &mut data, &mut state);
-                    state.message = "Last change undone. Ctrl+Z again redoes it.".into();
+                    reload(
+                        path,
+                        &mut data,
+                        &mut state,
+                        Some("Last change undone. Ctrl+Z again redoes it."),
+                    );
                 }
                 Err(error) => {
                     state.message = error.to_string();
@@ -220,9 +238,10 @@ pub fn run(path: &Path) -> Result<()> {
                 let result = perform_action(path, key.code, selected, &data, &mut session);
                 drop(output);
                 drop(input);
-                reload(path, &mut data, &mut state);
+                let reloaded = reload(path, &mut data, &mut state, None);
                 known_stamp = stamp(path);
                 match result {
+                    _ if !reloaded => {}
                     Ok(()) => {
                         let changed = before != data;
                         state.message = if changed {
@@ -275,6 +294,7 @@ pub fn run(path: &Path) -> Result<()> {
             KeyCode::Home => state.cursor = 0,
             KeyCode::End => state.cursor = state.query.len(),
             KeyCode::Char('u') if ctrl => state.clear(),
+            KeyCode::Char('w') if ctrl => state.remove_word(),
             KeyCode::Backspace => {
                 let previous = state.previous();
                 state.query.replace_range(previous..state.cursor, "");
@@ -340,7 +360,7 @@ fn clean(text: &str) -> String {
         .collect()
 }
 
-fn clip(text: &str, width: usize) -> String {
+pub(crate) fn clip(text: &str, width: usize) -> String {
     let text = clean(text);
     let mut used = 0;
     text.graphemes(true)
@@ -371,13 +391,25 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn row(
+pub(crate) fn row(
     output: &mut impl Write,
     y: usize,
     text: &str,
     width: usize,
     accent: bool,
     color: bool,
+) -> Result<()> {
+    result_row(output, y, text, width, accent, color, "")
+}
+
+fn result_row(
+    output: &mut impl Write,
+    y: usize,
+    text: &str,
+    width: usize,
+    accent: bool,
+    color: bool,
+    query: &str,
 ) -> Result<()> {
     queue!(output, cursor::MoveTo(0, y as u16))?;
     if accent {
@@ -386,9 +418,21 @@ fn row(
             queue!(output, SetForegroundColor(Color::Cyan))?;
         }
     }
+    let text = clip(text, width);
+    let mut end = 0;
+    for range in crate::model::match_ranges(&text, query) {
+        queue!(
+            output,
+            Print(&text[end..range.start]),
+            SetAttribute(Attribute::Underlined),
+            Print(&text[range.clone()]),
+            SetAttribute(Attribute::NoUnderline)
+        )?;
+        end = range.end;
+    }
     queue!(
         output,
-        Print(clip(text, width)),
+        Print(&text[end..]),
         SetAttribute(Attribute::Reset),
         ResetColor
     )?;
@@ -408,7 +452,8 @@ fn render(
     queue!(output, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
     if state.help && height >= 4 && width >= 10 {
         let text = format!(
-            "{}\n\nKeyboard help\nType to search (all words, case-insensitive).\nLeft/Right, Home/End, Delete: edit search.\nUp/Down: select item. PgUp/PgDn: scroll details.\nEnter: copy (never execute).\nCtrl+A: add; Ctrl+E: edit; Ctrl+D: remove.\nCtrl+G: move item; Ctrl+N: rename category.\nCtrl+Z: undo / redo last change.\nCtrl+R: reload (external changes also refresh automatically).\nCtrl+U: clear search; Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit; Tab completes only the current field.\nCategory fields: category candidates only.\nCommand fields: commands from that category only.\nDescription/confirmation/search: no command completion.\nCtrl+C or /cancel cancels forms; Enter accepts current values.\nMultiline paste stays in the current field.\n\nCLI: --show, --print, --copy, --move, --rename-category,\n--remove-category, --undo, --config-path. See --help.\n\nNo persistent input-history file is written.\n",
+            "{}\n\nKeyboard help\nType to search (all words, case-insensitive).\nLeft/Right, Home/End, Delete: edit search.\nUp/Down: select item. PgUp/PgDn: scroll details.\nEnter: copy (never execute).\nCtrl+A: add; Ctrl+E: edit; Ctrl+D: remove.\nCtrl+G: move item; Ctrl+N: rename category.\nCtrl+Z: undo / redo last change.\nCtrl+R: reload (external changes also refresh automatically).\nCtrl+W: remove a search word; Ctrl+U: clear search.
+Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit; Tab completes only the current field.\nCategory fields: category candidates only.\nCommand fields: commands from that category only.\nDescription/confirmation/search: no command completion.\nCtrl+C or /cancel cancels forms; Enter accepts current values.\nMultiline paste stays in the current field.\n\nCLI: --show, --print, --copy, --move, --rename-category,\n--remove-category, --undo, --config-path. See --help.\n\nNo persistent input-history file is written.\n",
             state.message
         );
         let lines = wrap(&text, width);
@@ -487,7 +532,7 @@ fn render(
             if total == 0 {
                 "No commands yet. Ctrl+A to add your first one."
             } else {
-                "No matches. Shorten the search or Ctrl+U to clear."
+                "No matches. Ctrl+W removes a word; Ctrl+U clears."
             },
             width,
             false,
@@ -496,13 +541,14 @@ fn render(
     }
     for (i, (category, index, entry)) in results.iter().enumerate().skip(start).take(list_height) {
         let marker = if i == state.selected { ">" } else { " " };
-        row(
+        result_row(
             &mut output,
             4 + i - start,
             &format!("{marker} [{category} #{}] {}", index + 1, entry.command),
             width,
             i == state.selected,
             color,
+            &state.query,
         )?;
     }
     let detail_start = 5 + list_height;
@@ -542,7 +588,15 @@ fn render(
             .take(detail_height)
             .enumerate()
         {
-            row(&mut output, detail_start + i, line, width, false, color)?;
+            result_row(
+                &mut output,
+                detail_start + i,
+                line,
+                width,
+                false,
+                color,
+                &state.query,
+            )?;
         }
     }
     // Reserve two rows for status, so clipboard setup guidance remains visible.
@@ -582,6 +636,57 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removing_a_word_keeps_the_suffix_and_a_valid_unicode_cursor() {
+        let mut state = State {
+            query: "障害 調査  suffix".into(),
+            cursor: "障害 調査  ".len(),
+            ..Default::default()
+        };
+        state.remove_word();
+        assert_eq!(state.query, "障害 suffix");
+        assert_eq!(state.cursor, "障害 ".len());
+        state.remove_word();
+        assert_eq!(state.query, "suffix");
+        assert_eq!(state.cursor, 0);
+        state.remove_word();
+        assert_eq!(state.query, "suffix");
+    }
+
+    #[test]
+    fn highlighted_rows_preserve_text_and_do_not_enable_color_with_no_color() {
+        let mut output = Vec::new();
+        result_row(&mut output, 0, "IP 日本語", 80, false, false, "ip 日本").unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[4mIP\x1b[24m"));
+        assert!(output.contains("\x1b[4m日本\x1b[24m語"));
+        assert!(!output.contains("38;"));
+    }
+    #[test]
+    fn failed_reload_preserves_data_and_displays_the_error_instead_of_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut data = Config::from([(
+            "notes".into(),
+            vec![CommandEntry {
+                command: "echo hello".into(),
+                description: String::new(),
+            }],
+        )]);
+        let original = data.clone();
+        let mut state = State::default();
+        std::fs::write(&path, "notes: [invalid").unwrap();
+        for message in [None, Some("Reloaded."), Some("Last change undone.")] {
+            assert!(!reload(&path, &mut data, &mut state, message));
+            assert_eq!(data, original);
+            assert!(state.help);
+            assert!(state.message.starts_with("Reload failed."));
+            assert!(state.message.contains("invalid YAML"));
+        }
+        config::save(&path, &original).unwrap();
+        assert!(reload(&path, &mut data, &mut state, Some("Reloaded.")));
+        assert_eq!(state.message, "Reloaded.");
+    }
     #[test]
     fn filter_combines_terms_across_category_command_and_description() {
         let data = Config::from([(

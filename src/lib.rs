@@ -25,6 +25,7 @@ impl From<std::io::Error> for Error {
 }
 
 pub mod browser;
+mod category_picker;
 pub mod clipboard;
 pub mod completion;
 pub mod interaction;
