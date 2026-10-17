@@ -61,6 +61,11 @@ def check_browser(root):
 
     try:
         expect("Ctrl+E Edit")
+        send("c")
+        expect("Search > c")
+        assert not copied.exists(), "Typing c in search unexpectedly copied a command"
+        send("\x15")
+        expect("1 matches")
         send("missing")
         expect("No matches")
         send("\x15")  # Ctrl+U
@@ -68,20 +73,32 @@ def check_browser(root):
         send("アドレス")
         expect("1 matches")
         send("\r")
+        expect("Command details")
+        assert not copied.exists(), "Opening details unexpectedly changed the clipboard"
+        send("\r")
+        expect("c Copy · e Edit · d Remove")
+        assert not copied.exists(), "Enter in details unexpectedly changed the clipboard"
+        send("?")
+        expect("Command details · keyboard help")
+        send("\x1b")
+        expect("c Copy")
+        send("c")  # Details accept a single key; search fields do not.
         expect("Copied command")
         assert copied.read_text() == command
         assert not (root / "must-not-exist").exists()
         helper.write_text("#!/bin/sh\nexit 1\n")
-        send("\r")
+        send("\x19")
         expect("Could not copy")
         send("\x1b")  # close full error message
-        expect("Ctrl+E Edit")
-        send("\x05")  # Ctrl+E
+        expect("c Copy")
+        send("e")  # Details open a separate editing form.
         expect("New command:")
-        send("\n")
+        send("\x15cmed\n")  # Action letters must remain ordinary text in the form.
         expect("New description")
         send("\x15updated description\n")
         expect("Search cleared")
+        output = subprocess.check_output([BINARY, "--print", "network", "1"], env=env, text=True)
+        assert output.strip() == "cmed", "Editing interpreted action letters as shortcuts"
         expect_text = "updated description"
         send("\x15")
         expect(expect_text)
@@ -95,6 +112,24 @@ def check_browser(root):
         expect("2 matches")
         send("\x1b[B")  # Down
         expect("No description yet")
+        send("\r")
+        expect("d Remove")
+        send("d")
+        expect('Remove "pwd"?')
+        send("n\n")
+        expect("No changes.")
+        assert "pwd" in subprocess.check_output([BINARY, "network"], env=env, text=True)
+        send("\r")
+        expect("d Remove")
+        send("d")
+        expect('Remove "pwd"?')
+        send("y\n")
+        expect("1 matches")
+        send("\r")
+        expect("u Undo")
+        send("u")
+        expect("Last change undone.")
+        assert "pwd" in subprocess.check_output([BINARY, "network"], env=env, text=True)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 8, 25, 0, 0))
         # Trigger redraw even on systems that don't deliver SIGWINCH for this PTY.
         send("\x15")

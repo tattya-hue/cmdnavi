@@ -108,6 +108,7 @@ fn japanese_categories_work_for_registration_completion_renaming_and_undo() {
 fn help_version_and_completion_scripts_work_without_a_config_location() {
     for args in [
         vec!["--help"],
+        vec!["--help-all"],
         vec!["--version"],
         vec!["add", "--help"],
         vec!["list", "-h"],

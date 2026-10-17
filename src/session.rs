@@ -88,10 +88,6 @@ impl<'a> Session<'a> {
             let mut editor =
                 Editor::<Suggestions, MemHistory>::with_history(config, MemHistory::new())
                     .map_err(|e| Error(e.to_string()))?;
-            let suggestions = completion::candidates(data, &context, "");
-            for item in &suggestions {
-                let _ = editor.add_history_entry(&item.value);
-            }
             editor.set_helper(Some(Suggestions {
                 data: data.clone(),
                 context,

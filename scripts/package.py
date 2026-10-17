@@ -40,7 +40,7 @@ def main():
     output.mkdir(exist_ok=True)
     files = [binary, ROOT / "README.md", ROOT / "LICENSE", ROOT / "RELEASE_NOTES.md"]
     files += sorted((ROOT / "completions").iterdir())
-    files += [ROOT / "docs" / "completion.md"]
+    files += [ROOT / "docs" / "completion.md", ROOT / "docs" / "development.md"]
 
     def member(file):
         if file.parent.name in {"completions", "docs"}:

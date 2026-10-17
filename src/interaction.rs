@@ -53,10 +53,54 @@ pub fn edit_entry(
 }
 
 pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Option<String>> {
-    let data = config::load(path)?;
+    choose_category_for(path, session, true, "Choose category · type to filter")
+}
+
+pub fn choose_existing_category_with(
+    path: &Path,
+    session: &mut Session<'_>,
+) -> Result<Option<String>> {
+    choose_category_for(
+        path,
+        session,
+        false,
+        "Choose existing category · type to filter",
+    )
+}
+
+pub(crate) fn choose_destination_with(
+    path: &Path,
+    source: &str,
+    session: &mut Session<'_>,
+) -> Result<Option<String>> {
+    choose_category_for(
+        path,
+        session,
+        true,
+        &format!("Choose destination · from [{source}]"),
+    )
+}
+
+fn choose_category_for(
+    path: &Path,
+    session: &mut Session<'_>,
+    allow_new: bool,
+    title: &str,
+) -> Result<Option<String>> {
+    let mut data = config::load(path)?;
+    if !allow_new {
+        data.retain(|_, entries| !entries.is_empty());
+        if data.is_empty() {
+            writeln!(
+                session.output,
+                "No saved commands. Use `cmdnavi add` to register one."
+            )?;
+            return Ok(None);
+        }
+    }
     if session.terminal {
         session.output.flush()?;
-        let selected = crate::category_picker::choose(&data)?;
+        let selected = crate::category_picker::choose(&data, allow_new, title)?;
         if selected.is_none() {
             writeln!(session.output, "Cancelled.")?;
         }
@@ -65,7 +109,12 @@ pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Op
     let categories: Vec<_> = data.keys().collect();
     writeln!(
         session.output,
-        "Choose a category or type a new name. Tab completes; ↑↓ recall candidates. Ctrl+C or /cancel cancels."
+        "{}",
+        if allow_new {
+            "Choose a category or type a new name. /cancel cancels."
+        } else {
+            "Choose an existing category. Enter or /cancel cancels."
+        }
     )?;
     for (i, name) in categories.iter().enumerate() {
         writeln!(
@@ -78,7 +127,11 @@ pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Op
     }
     loop {
         let Some(value) = session.ask(
-            "Category (name / #number, Enter = general): ",
+            if allow_new {
+                "Category (name / #number, Enter = general): "
+            } else {
+                "Category (name / #number, Enter cancels): "
+            },
             "",
             Context::Categories,
             &data,
@@ -104,10 +157,21 @@ pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Op
                 }
             }
         } else if value.is_empty() {
+            if !allow_new {
+                writeln!(session.output, "Cancelled.")?;
+                return Ok(None);
+            }
             "general"
         } else {
             value
         };
+        if !allow_new && !data.contains_key(category) {
+            writeln!(
+                session.output,
+                "Choose an existing category name or #number."
+            )?;
+            continue;
+        }
         match validate_category(category) {
             Ok(()) => return Ok(Some(category.to_owned())),
             Err(message) => writeln!(session.output, "{message}")?,
@@ -123,12 +187,6 @@ pub fn add_with(path: &Path, category: &str, session: &mut Session<'_>) -> Resul
         session.output,
         "Add to [{category}] · Tab completes saved commands · Ctrl+C or /cancel cancels"
     )?;
-    if session.terminal {
-        writeln!(
-            session.output,
-            "Description: /back edits the command; /category changes the category. Input is kept when you go back."
-        )?;
-    }
     loop {
         let data = config::load(path)?;
         loop {
@@ -158,6 +216,12 @@ pub fn add_with(path: &Path, category: &str, session: &mut Session<'_>) -> Resul
                 for line in command.lines() {
                     writeln!(session.output, "  {line}")?;
                 }
+            }
+            if session.terminal {
+                writeln!(
+                    session.output,
+                    "Enter skips · /back edits command · /category changes category · Ctrl+C or /cancel cancels"
+                )?;
             }
             let Some(description) = session.plain("Description (optional, Enter to skip): ")?
             else {
@@ -281,6 +345,12 @@ pub fn edit_entry_with(
             old.command, old.description
         )?;
     }
+    if session.terminal {
+        writeln!(
+            session.output,
+            "Edit text with ←/→ · Tab completes commands · Enter continues · Ctrl+C or /cancel cancels"
+        )?;
+    }
     let command = loop {
         let initial = if session.terminal { &old.command } else { "" };
         let Some(value) = session.ask(
@@ -308,6 +378,12 @@ pub fn edit_entry_with(
     } else {
         ""
     };
+    if session.terminal {
+        writeln!(
+            session.output,
+            "Edit description · Enter saves · /clear removes description · Ctrl+C or /cancel cancels"
+        )?;
+    }
     let Some(value) = session.ask(
         "New description (/clear to remove): ",
         initial,
@@ -386,10 +462,27 @@ pub fn pick_entry(
     entries: &[CommandEntry],
     session: &mut Session<'_>,
 ) -> Result<Option<usize>> {
+    pick_entry_for(category, entries, session, "Choose a command")
+}
+
+pub(crate) fn pick_entry_for(
+    category: &str,
+    entries: &[CommandEntry],
+    session: &mut Session<'_>,
+    title: &str,
+) -> Result<Option<usize>> {
     if entries.is_empty() {
         return Err(Error(format!(
             "Category [{category}] has no commands. Use `cmdnavi add {category}`."
         )));
+    }
+    if session.terminal {
+        session.output.flush()?;
+        let selected = crate::browser::choose_entry(category, entries, title)?;
+        if selected.is_none() {
+            writeln!(session.output, "Cancelled.")?;
+        }
+        return Ok(selected);
     }
     for (i, entry) in entries.iter().enumerate() {
         writeln!(
@@ -435,6 +528,14 @@ pub fn remove_entry(
     let entry = snapshot
         .get(index)
         .ok_or_else(|| Error("Choose an existing item.".into()))?;
+    writeln!(session.output, "Category: [{category}]")?;
+    if !entry.description.is_empty() {
+        writeln!(
+            session.output,
+            "Description: {}",
+            crate::session::visible(&entry.description)
+        )?;
+    }
     if !session.confirm(&format!(
         "Remove \"{}\"? [y/N]: ",
         crate::session::visible(&entry.command)

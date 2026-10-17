@@ -38,7 +38,7 @@ impl Picker {
         self.cursor += text.len();
         self.selected = 0;
     }
-    fn choices(&self, data: &Config) -> Vec<(String, bool)> {
+    fn choices(&self, data: &Config, allow_new: bool) -> Vec<(String, bool)> {
         let query = self.query.trim().to_lowercase();
         if let Some(name) = query
             .strip_prefix('#')
@@ -58,7 +58,7 @@ impl Picker {
             .map(|name| (name.clone(), false))
             .collect();
         let new = self.new_name();
-        if validate_category(new).is_ok() && !data.contains_key(new) {
+        if allow_new && validate_category(new).is_ok() && !data.contains_key(new) {
             choices.push((new.into(), true));
         }
         choices
@@ -72,13 +72,13 @@ impl Picker {
     }
 }
 
-pub(crate) fn choose(data: &Config) -> Result<Option<String>> {
+pub(crate) fn choose(data: &Config, allow_new: bool, title: &str) -> Result<Option<String>> {
     let _screen = Screen::enter()?;
     let mut state = Picker::default();
     loop {
-        let choices = state.choices(data);
+        let choices = state.choices(data, allow_new);
         state.selected = state.selected.min(choices.len().saturating_sub(1));
-        render(data, &choices, &state)?;
+        render(data, &choices, &state, allow_new, title)?;
         let (width, height) = terminal::size()?;
         let usable = width >= 36 && height >= 10;
         match event::read()? {
@@ -101,7 +101,9 @@ pub(crate) fn choose(data: &Config) -> Result<Option<String>> {
                     KeyCode::Esc => return Ok(None),
                     KeyCode::Char('c') if ctrl => return Ok(None),
                     KeyCode::Char('u') if ctrl => state = Picker::default(),
-                    KeyCode::Char('n') if ctrl && validate_category(state.new_name()).is_ok() => {
+                    KeyCode::Char('n')
+                        if ctrl && allow_new && validate_category(state.new_name()).is_ok() =>
+                    {
                         return Ok(Some(state.new_name().into()));
                     }
                     KeyCode::Enter | KeyCode::Char('j' | 'm')
@@ -156,7 +158,13 @@ pub(crate) fn choose(data: &Config) -> Result<Option<String>> {
     }
 }
 
-fn render(data: &Config, choices: &[(String, bool)], state: &Picker) -> Result<()> {
+fn render(
+    data: &Config,
+    choices: &[(String, bool)],
+    state: &Picker,
+    allow_new: bool,
+    title: &str,
+) -> Result<()> {
     let (width, height) = terminal::size()?;
     let width = usize::from(width).saturating_sub(1);
     let height = usize::from(height);
@@ -175,14 +183,7 @@ fn render(data: &Config, choices: &[(String, bool)], state: &Picker) -> Result<(
         output.flush()?;
         return Ok(());
     }
-    row(
-        &mut output,
-        0,
-        "Choose category · type to filter by any part of its name",
-        width,
-        true,
-        color,
-    )?;
+    row(&mut output, 0, title, width, true, color)?;
     let label = "Category (name / filter): ";
     let available = width.saturating_sub(label.len() + 1);
     let mut start = 0;
@@ -236,7 +237,9 @@ fn render(data: &Config, choices: &[(String, bool)], state: &Picker) -> Result<(
     row(
         &mut output,
         height - 2,
-        if width < 58 {
+        if !allow_new {
+            "↑↓ Select · Enter Use · Esc Cancel"
+        } else if width < 58 {
             "↑↓ Enter · ^N New · Esc Cancel"
         } else {
             "Ctrl+N use typed name · Ctrl+U clear · Esc cancel"
@@ -262,14 +265,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            picker.choices(&data),
+            picker.choices(&data, true),
             [("network".into(), false), ("WORK".into(), true)]
         );
         picker.query = "調査".into();
-        assert_eq!(picker.choices(&data)[0], ("障害調査".into(), false));
+        assert_eq!(picker.choices(&data, true)[0], ("障害調査".into(), false));
         picker.query = "障害調査".into();
-        assert_eq!(picker.choices(&data), [("障害調査".into(), false)]);
+        assert_eq!(picker.choices(&data, true), [("障害調査".into(), false)]);
         picker.query = "bad name".into();
-        assert!(picker.choices(&data).is_empty());
+        assert!(picker.choices(&data, true).is_empty());
+        picker.query = "new-category".into();
+        assert!(picker.choices(&data, false).is_empty());
+        assert_eq!(picker.choices(&data, true), [("new-category".into(), true)]);
     }
 }

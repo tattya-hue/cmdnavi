@@ -6,7 +6,8 @@ pub const ACTIONS: &[&str] = &["add", "edit", "list", "remove"];
 pub const OPTIONS: &[&str] = &[
     "--help",
     "--version",
-    "--browse",
+    "--help-all",
+    "--edit-yaml",
     "--search",
     "--show",
     "--print",
@@ -47,7 +48,7 @@ pub fn context(words: &[String], position: usize) -> Context {
         ("--completions", 1) => Context::Shells,
         (
             "--show" | "--print" | "--copy" | "--move" | "--rename-category" | "--remove-category"
-            | "--",
+            | "--" | "--edit-yaml",
             1,
         ) => Context::Categories,
         ("--rename-category", 2) | ("--move", 3) => Context::Categories,
@@ -72,7 +73,7 @@ pub fn candidates(data: &Config, context: &Context, prefix: &str) -> Vec<Candida
                 .iter()
                 .map(|(name, entries)| plain(name, &format!("{} commands", entries.len())))
                 .collect();
-            if matches!(context, Context::ActionCategory) {
+            if matches!(context, Context::ActionCategory) && prefix.starts_with('-') {
                 values.extend([plain("--help", "Action help"), plain("-h", "Action help")]);
             }
             values
@@ -80,7 +81,12 @@ pub fn candidates(data: &Config, context: &Context, prefix: &str) -> Vec<Candida
         Context::Root => ACTIONS
             .iter()
             .map(|s| plain(s, "Action"))
-            .chain(OPTIONS.iter().map(|s| plain(s, "Option")))
+            .chain(
+                OPTIONS
+                    .iter()
+                    .filter(|_| prefix.starts_with('-'))
+                    .map(|s| plain(s, "Option")),
+            )
             .chain(
                 data.iter()
                     .filter(|(name, _)| !name.starts_with('-'))

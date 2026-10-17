@@ -60,6 +60,7 @@ fn completions_follow_argument_context_and_never_leak_into_descriptions_or_searc
         "--move",
         "--rename-category",
         "--remove-category",
+        "--edit-yaml",
         "--",
     ] {
         let categories = values(&[action, ""], 1);
@@ -93,7 +94,7 @@ fn completion_reads_newly_saved_categories_without_writing_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.yaml");
     let args = ["--complete", "bash", "1", "--", "edit", ""];
-    assert_eq!(run(&path, &args, "").unwrap(), "--help\0-h\0");
+    assert_eq!(run(&path, &args, "").unwrap(), "");
     assert!(!path.exists());
     config::save(&path, &data()).unwrap();
     let before = std::fs::read(&path).unwrap();
@@ -104,6 +105,55 @@ fn completion_reads_newly_saved_categories_without_writing_data() {
     config::save(&path, &updated).unwrap();
     assert!(run(&path, &args, "").unwrap().contains("docker"));
     assert!(!path.with_extension("yaml.undo").exists());
+}
+
+#[test]
+fn basic_help_and_unprefixed_completion_focus_on_daily_operations() {
+    let path = Path::new("unused.yaml");
+    let basic = run(path, &["--help"], "").unwrap();
+    let detailed = run(path, &["--help-all"], "").unwrap();
+    assert!(basic.lines().count() <= 24);
+    assert!(basic.contains("--help-all"));
+    for option in [
+        "--copy",
+        "--move",
+        "--rename-category",
+        "--remove-category",
+        "--completions",
+        "--edit-yaml",
+    ] {
+        assert!(!basic.contains(option), "{option}");
+        assert!(detailed.contains(option), "{option}");
+    }
+    assert!(!detailed.contains("--browse"));
+    let root = values(&[""], 0);
+    assert!(root.iter().all(|candidate| !candidate.starts_with('-')));
+    assert!(values(&["--"], 0).contains(&"--edit-yaml".into()));
+    assert!(!values(&["--"], 0).contains(&"--browse".into()));
+    assert!(values(&["--edit-yaml", "network", ""], 2).is_empty());
+}
+
+#[test]
+fn undo_can_only_run_once_until_another_change_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    run(&path, &["add", "notes", "echo first"], "").unwrap();
+    let backup = path.with_extension("yaml.undo");
+    let original_backup = std::fs::read(&backup).unwrap();
+    run(&path, &["--undo"], "").unwrap();
+    for _ in 0..2 {
+        assert!(
+            run(&path, &["--undo"], "")
+                .unwrap_err()
+                .to_string()
+                .contains("already undone")
+        );
+        assert!(config::load(&path).unwrap().is_empty());
+        assert_eq!(std::fs::read(&backup).unwrap(), original_backup);
+    }
+    run(&path, &["add", "notes", "echo second"], "").unwrap();
+    run(&path, &["--undo"], "").unwrap();
+    assert!(config::load(&path).unwrap().is_empty());
 }
 
 #[test]
@@ -262,13 +312,47 @@ fn move_rename_remove_and_undo_preserve_data_and_check_conflicts() {
     assert!(!config::load(&path).unwrap().contains_key("ops"));
     run(&path, &["--undo"], "").unwrap();
     assert!(config::load(&path).unwrap().contains_key("ops"));
-    run(&path, &["--undo"], "").unwrap();
-    assert!(!config::load(&path).unwrap().contains_key("ops"));
+    let restored = config::load(&path).unwrap();
+    assert!(
+        run(&path, &["--undo"], "")
+            .unwrap_err()
+            .to_string()
+            .contains("already undone")
+    );
+    assert_eq!(config::load(&path).unwrap(), restored);
     let mut external = config::load(&path).unwrap();
     external.insert("external".into(), vec![]);
     config::save(&path, &external).unwrap();
     assert!(run(&path, &["--undo"], "").is_err());
     assert_eq!(config::load(&path).unwrap(), external);
+}
+
+#[test]
+fn guided_move_and_remove_allow_cancellation_without_losing_the_selected_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    run(&path, &["add", "notes", "echo alpha", "first"], "").unwrap();
+    run(&path, &["add", "notes", "echo beta", "second"], "").unwrap();
+    run(&path, &["--move", "notes"], "2\ntools\n").unwrap();
+    assert_eq!(
+        run(&path, &["--print", "tools", "1"], "").unwrap(),
+        "echo beta"
+    );
+    assert_eq!(
+        run(&path, &["--print", "notes", "1"], "").unwrap(),
+        "echo alpha"
+    );
+    let before = config::load(&path).unwrap();
+    assert!(
+        run(&path, &["--move", "notes"], "1\nnotes\n")
+            .unwrap()
+            .contains("already in [notes]")
+    );
+    run(&path, &["--move", "notes"], "1\n/cancel\n").unwrap();
+    run(&path, &["remove"], "tools\n1\nn\n").unwrap();
+    assert_eq!(config::load(&path).unwrap(), before);
+    run(&path, &["remove", "tools"], "1\ny\n").unwrap();
+    assert!(config::load(&path).unwrap()["tools"].is_empty());
 }
 #[test]
 fn item_actions_accept_exact_command_and_shell_metacharacters_remain_data() {

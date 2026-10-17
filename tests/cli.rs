@@ -69,7 +69,7 @@ fn help_version_and_argument_errors_have_expected_exit_codes() {
     );
 
     for (args, expected) in [
-        (vec!["remove"], "needs a category"),
+        (vec!["--print"], "needs a category"),
         (vec!["list", "extra"], "does not accept arguments"),
         (vec!["--unknown"], "unknown option"),
     ] {
@@ -127,12 +127,58 @@ fn invalid_editor_yaml_does_not_modify_configuration() {
         "#!/bin/sh\nprintf '%s\\n' 'not: [valid' > \"$1\"\n",
     );
 
-    let edited = run_with_env(dir.path(), &["edit", "network"], "", &[("VISUAL", &editor)]);
+    let edited = run_with_env(
+        dir.path(),
+        &["--edit-yaml", "network"],
+        "",
+        &[("VISUAL", &editor)],
+    );
     assert!(!edited.status.success());
     assert!(stderr(&edited).contains("changes were not saved"));
     assert!(stderr(&edited).contains("Choose Y below to reopen"));
     assert!(stderr(&edited).contains("Your edits are still here:"));
     assert_eq!(fs::read(config_path).unwrap(), before);
+}
+
+#[test]
+fn ordinary_edit_selects_a_saved_item_without_opening_the_external_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    for value in ["echo first", "echo second"] {
+        assert!(
+            run(dir.path(), &["add", "notes", value, "original"], "")
+                .status
+                .success()
+        );
+    }
+    let sentinel = dir.path().join("editor-was-invoked");
+    let editor = script(
+        dir.path(),
+        "unexpected-editor.sh",
+        "#!/bin/sh\ntouch \"$XDG_CONFIG_HOME/editor-was-invoked\"\nexit 1\n",
+    );
+    let output = run_with_env(
+        dir.path(),
+        &["edit", "notes"],
+        "2\necho updated\nupdated description\n",
+        &[("VISUAL", &editor)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = run_with_env(
+        dir.path(),
+        &["edit"],
+        "notes\n1\n\nnew description\n",
+        &[("VISUAL", &editor)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!sentinel.exists());
+    let shown = stdout(&run(dir.path(), &["notes"], ""));
+    assert!(shown.contains("echo first\n  new description"));
+    assert!(shown.contains("echo updated\n  updated description"));
+    let empty = tempfile::tempdir().unwrap();
+    let output = run(empty.path(), &["edit"], "");
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("No saved commands"));
+    assert!(!empty.path().join("cmdnavi/config.yaml").exists());
 }
 
 #[test]
@@ -146,7 +192,7 @@ fn first_edit_and_missing_category_edit_use_templates() {
     );
     let first_edit = run_with_env(
         dir.path(),
-        &["edit"],
+        &["--edit-yaml"],
         "",
         &[("VISUAL", &full_template_editor)],
     );
@@ -160,7 +206,7 @@ fn first_edit_and_missing_category_edit_use_templates() {
     );
     let unchanged = run_with_env(
         dir.path(),
-        &["edit", "network"],
+        &["--edit-yaml", "network"],
         "",
         &[("VISUAL", &category_template_editor)],
     );
@@ -174,7 +220,7 @@ fn first_edit_and_missing_category_edit_use_templates() {
     );
     let created = run_with_env(
         dir.path(),
-        &["edit", "network"],
+        &["--edit-yaml", "network"],
         "",
         &[("VISUAL", &creating_editor)],
     );
@@ -203,7 +249,7 @@ fn category_and_full_edits_work_through_an_external_editor() {
     );
     let category_edit = run_with_env(
         dir.path(),
-        &["edit", "network"],
+        &["--edit-yaml", "network"],
         "",
         &[("VISUAL", &category_editor)],
     );
@@ -216,7 +262,12 @@ fn category_and_full_edits_work_through_an_external_editor() {
         "full-editor.sh",
         "#!/bin/sh\nprintf '%s\\n' 'git:' '  - command: git status' '    description: show status' > \"$1\"\n",
     );
-    let full_edit = run_with_env(dir.path(), &["edit"], "", &[("VISUAL", &full_editor)]);
+    let full_edit = run_with_env(
+        dir.path(),
+        &["--edit-yaml"],
+        "",
+        &[("VISUAL", &full_editor)],
+    );
     assert!(full_edit.status.success(), "{}", stderr(&full_edit));
     assert_eq!(stdout(&run(dir.path(), &["list"], "")), "git\n");
 }
@@ -235,7 +286,12 @@ fn an_edit_conflict_preserves_the_external_change() {
         "#!/bin/sh\nprintf '%s\\n' '- command: editor' '  description: editor' > \"$1\"\nprintf '%s\\n' 'network:' '  - command: concurrent' '    description: concurrent' > \"$XDG_CONFIG_HOME/cmdnavi/config.yaml\"\n",
     );
 
-    let edited = run_with_env(dir.path(), &["edit", "network"], "", &[("VISUAL", &editor)]);
+    let edited = run_with_env(
+        dir.path(),
+        &["--edit-yaml", "network"],
+        "",
+        &[("VISUAL", &editor)],
+    );
     assert!(!edited.status.success());
     assert!(stderr(&edited).contains("configuration changed while the editor was open"));
     assert!(stderr(&edited).contains("Review the latest configuration"));

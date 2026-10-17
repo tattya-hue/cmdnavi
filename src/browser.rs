@@ -52,6 +52,7 @@ struct State {
     message: String,
     help: bool,
     help_offset: usize,
+    viewing: bool,
 }
 impl State {
     fn insert(&mut self, value: &str) {
@@ -76,6 +77,7 @@ impl State {
     fn changed(&mut self) {
         self.selected = 0;
         self.detail_offset = 0;
+        self.viewing = false;
     }
     fn clear(&mut self) {
         self.query.clear();
@@ -124,6 +126,8 @@ fn reload(path: &Path, data: &mut Config, state: &mut State, message: Option<&st
                     .position(|(c, _, e)| *c == category && e.command == command)
             {
                 state.selected = i;
+            } else {
+                state.viewing = false;
             }
             true
         }
@@ -137,14 +141,33 @@ fn reload(path: &Path, data: &mut Config, state: &mut State, message: Option<&st
 }
 
 pub fn run(path: &Path) -> Result<()> {
-    let mut data = config::load(path)?;
-    let mut known_stamp = stamp(path);
+    run_screen(config::load(path)?, Some(path), None).map(|_| ())
+}
+
+pub(crate) fn choose_entry(
+    category: &str,
+    entries: &[CommandEntry],
+    title: &str,
+) -> Result<Option<usize>> {
+    let data = Config::from([(category.into(), entries.to_vec())]);
+    run_screen(data, None, Some(title)).map(|selected| selected.map(|(_, index)| index))
+}
+
+fn run_screen(
+    mut data: Config,
+    path: Option<&Path>,
+    selection_title: Option<&str>,
+) -> Result<Option<(String, usize)>> {
+    let selecting = selection_title.is_some();
+    let mut known_stamp = path.and_then(stamp);
     let mut state = State::default();
     let mut screen = Screen::enter()?;
     let mut copying: Option<std::sync::mpsc::Receiver<Result<()>>> = None;
     let mut dirty = true;
     loop {
-        if known_stamp != stamp(path) {
+        if let Some(path) = path
+            && known_stamp != stamp(path)
+        {
             reload(path, &mut data, &mut state, None);
             known_stamp = stamp(path);
             dirty = true;
@@ -166,22 +189,31 @@ pub fn run(path: &Path) -> Result<()> {
         let results = matches(&data, &state.query);
         state.selected = state.selected.min(results.len().saturating_sub(1));
         if dirty {
-            render(&data, &results, &mut state)?;
+            if results.is_empty() {
+                state.viewing = false;
+            }
+            render(&data, &results, &mut state, selection_title)?;
             dirty = false;
         }
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
         dirty = true;
-        let key = match event::read()? {
+        let mut key = match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
-            Event::Paste(text) if !state.help => {
+            Event::Paste(text) if !state.help && !state.viewing => {
                 let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
                 state.insert(&text);
                 continue;
             }
             _ => continue,
         };
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('j' | 'm'))
+        {
+            key.code = KeyCode::Enter;
+            key.modifiers = KeyModifiers::NONE;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if state.help {
             match key.code {
@@ -195,32 +227,91 @@ pub fn run(path: &Path) -> Result<()> {
             }
             continue;
         }
+        let (width, height) = terminal::size()?;
+        if width < 36 || height < 12 {
+            if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+                break;
+            }
+            continue;
+        }
+        // Details have no text input: offer single-key actions there only.
+        // Search and form fields must keep these letters as ordinary input.
+        if state.viewing && key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            match key.code {
+                KeyCode::Char('c') => {
+                    key.code = KeyCode::Char('y');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                KeyCode::Char('a' | 'e' | 'd' | 'n' | 'r') => {
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                KeyCode::Char('m') => {
+                    key.code = KeyCode::Char('g');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                KeyCode::Char('u') => {
+                    key.code = KeyCode::Char('z');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                KeyCode::Char('?') => key.code = KeyCode::F(1),
+                _ => {}
+            }
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if state.viewing {
+            match key.code {
+                KeyCode::Esc => {
+                    state.viewing = false;
+                    state.detail_offset = 0;
+                    continue;
+                }
+                KeyCode::Up => {
+                    state.detail_offset = state.detail_offset.saturating_sub(1);
+                    continue;
+                }
+                KeyCode::Down => {
+                    state.detail_offset = state.detail_offset.saturating_add(1);
+                    continue;
+                }
+                KeyCode::PageUp => {
+                    state.detail_offset = state.detail_offset.saturating_sub(8);
+                    continue;
+                }
+                KeyCode::PageDown => {
+                    state.detail_offset = state.detail_offset.saturating_add(8);
+                    continue;
+                }
+                _ if !ctrl && key.code != KeyCode::F(1) => continue,
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => break,
             KeyCode::F(1) => {
                 state.help = true;
                 state.help_offset = 0;
             }
-            KeyCode::Char('r') if ctrl => {
+            KeyCode::Char('r') if ctrl && !selecting => {
+                let path = path.expect("browse path");
                 reload(path, &mut data, &mut state, Some("Reloaded."));
                 known_stamp = stamp(path);
             }
-            KeyCode::Char('z') if ctrl => match config::undo(path) {
-                Ok(()) => {
-                    reload(
-                        path,
-                        &mut data,
-                        &mut state,
-                        Some("Last change undone. Ctrl+Z again redoes it."),
-                    );
+            KeyCode::Char('z') if ctrl && !selecting => {
+                let path = path.expect("browse path");
+                match config::undo(path) {
+                    Ok(()) => {
+                        reload(path, &mut data, &mut state, Some("Last change undone."));
+                    }
+                    Err(error) => {
+                        state.message = error.to_string();
+                        state.help = true;
+                        state.help_offset = 0;
+                    }
                 }
-                Err(error) => {
-                    state.message = error.to_string();
-                    state.help = true;
-                    state.help_offset = 0;
-                }
-            },
-            KeyCode::Char('a' | 'e' | 'd' | 'g' | 'n') if ctrl => {
+            }
+            KeyCode::Char('a' | 'e' | 'd' | 'g' | 'n') if ctrl && !selecting => {
+                let path = path.expect("browse path");
+                state.viewing = false;
                 let selected = results
                     .get(state.selected)
                     .map(|(c, i, _)| (c.to_string(), *i));
@@ -268,7 +359,17 @@ pub fn run(path: &Path) -> Result<()> {
                 }
                 screen = Screen::enter()?;
             }
-            KeyCode::Enter if copying.is_none() => {
+            KeyCode::Enter => {
+                if selecting {
+                    if let Some((category, index, _)) = results.get(state.selected) {
+                        return Ok(Some(((*category).into(), *index)));
+                    }
+                } else if !results.is_empty() {
+                    state.viewing = true;
+                    state.detail_offset = 0;
+                }
+            }
+            KeyCode::Char('y') if ctrl && !selecting && copying.is_none() => {
                 if let Some((_, _, entry)) = results.get(state.selected) {
                     let text = entry.command.clone();
                     let (sender, receiver) = std::sync::mpsc::channel();
@@ -276,7 +377,7 @@ pub fn run(path: &Path) -> Result<()> {
                         let _ = sender.send(clipboard::copy(&text));
                     });
                     copying = Some(receiver);
-                    state.message = "Copying… Esc exits without waiting.".into();
+                    state.message = "Copying command text… You can keep browsing.".into();
                 }
             }
             KeyCode::Up => {
@@ -311,7 +412,7 @@ pub fn run(path: &Path) -> Result<()> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn perform_action(
@@ -337,7 +438,7 @@ fn perform_action(
         }
         KeyCode::Char('g') => {
             writeln!(s.output, "Move the selected command from [{category}].")?;
-            if let Some(target) = interaction::choose_category_with(path, s)? {
+            if let Some(target) = interaction::choose_destination_with(path, &category, s)? {
                 interaction::move_entry(path, &category, index, &data[&category], &target)?;
             }
             Ok(())
@@ -443,6 +544,7 @@ fn render(
     data: &Config,
     results: &[(&str, usize, &CommandEntry)],
     state: &mut State,
+    selection_title: Option<&str>,
 ) -> Result<()> {
     let (width, height) = terminal::size()?;
     let width = usize::from(width).saturating_sub(1);
@@ -451,11 +553,21 @@ fn render(
     let mut output = io::stdout().lock();
     queue!(output, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
     if state.help && height >= 4 && width >= 10 {
-        let text = format!(
-            "{}\n\nKeyboard help\nType to search (all words, case-insensitive).\nLeft/Right, Home/End, Delete: edit search.\nUp/Down: select item. PgUp/PgDn: scroll details.\nEnter: copy (never execute).\nCtrl+A: add; Ctrl+E: edit; Ctrl+D: remove.\nCtrl+G: move item; Ctrl+N: rename category.\nCtrl+Z: undo / redo last change.\nCtrl+R: reload (external changes also refresh automatically).\nCtrl+W: remove a search word; Ctrl+U: clear search.
-Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit; Tab completes only the current field.\nCategory fields: category candidates only.\nCommand fields: commands from that category only.\nDescription/confirmation/search: no command completion.\nCtrl+C or /cancel cancels forms; Enter accepts current values.\nMultiline paste stays in the current field.\n\nCLI: --show, --print, --copy, --move, --rename-category,\n--remove-category, --undo, --config-path. See --help.\n\nNo persistent input-history file is written.\n",
-            state.message
-        );
+        let text = if let Some(title) = selection_title {
+            format!(
+                "{title}\n\nType to filter by command text or description.\nUp/Down: select. Enter: choose.\nPgUp/PgDn: scroll the preview.\nCtrl+U: clear the search.\nEsc / Ctrl+C: cancel.\n"
+            )
+        } else if state.viewing {
+            format!(
+                "{}\n\nCommand details · keyboard help\nThis screen does not edit text.\nc: copy command text only (not its description).\ne: edit; d: remove (confirmation required); m: move.\na: add; n: rename category; u: undo the last change once.\nr: reload. ?: help.\nUp/Down, PgUp/PgDn: scroll.\nEsc: back to search. Ctrl+C: exit.\n\nThe Ctrl shortcuts from the search screen also work here.\nEditing opens a separate form: letters are ordinary text there.\n",
+                state.message
+            )
+        } else {
+            format!(
+                "{}\n\nSearch · keyboard help\nType to search; Ctrl+W removes a word; Ctrl+U clears.\nUp/Down: select. Enter: open details. Esc / Ctrl+C: exit.\nLeft/Right, Home/End, Delete: edit search.\nPgUp/PgDn: scroll the preview.\nCtrl+A: add; Ctrl+E: edit; Ctrl+D: remove.\nCtrl+G: move; Ctrl+N: rename category.\nCtrl+Y: copy command text only.\nCtrl+Z: undo the last saved change once. Ctrl+R: reload.\n\nOpen details with Enter to use single-key actions: c copy, e edit, d remove, m move.\n\nCLI details: cmdnavi --help-all\n",
+                state.message
+            )
+        };
         let lines = wrap(&text, width);
         let count = height.saturating_sub(2);
         state.help_offset = state.help_offset.min(lines.len().saturating_sub(count));
@@ -486,14 +598,21 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
         output.flush()?;
         return Ok(());
     }
+    if state.viewing
+        && let Some((category, _, entry)) = results.get(state.selected)
+    {
+        return render_details(&mut output, category, entry, state, width, height, color);
+    }
     let total: usize = data.values().map(Vec::len).sum();
     row(
         &mut output,
         0,
-        &format!(
-            "cmdnavi   |   {} categories   ·   {total} commands",
-            data.len()
-        ),
+        &selection_title.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "cmdnavi   |   {} categories   ·   {total} commands",
+                data.len()
+            )
+        }),
         width,
         true,
         color,
@@ -539,12 +658,12 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
             color,
         )?;
     }
-    for (i, (category, index, entry)) in results.iter().enumerate().skip(start).take(list_height) {
+    for (i, (category, _, entry)) in results.iter().enumerate().skip(start).take(list_height) {
         let marker = if i == state.selected { ">" } else { " " };
         result_row(
             &mut output,
             4 + i - start,
-            &format!("{marker} [{category} #{}] {}", index + 1, entry.command),
+            &format!("{marker} [{category}] {}", entry.command),
             width,
             i == state.selected,
             color,
@@ -553,19 +672,8 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
     }
     let detail_start = 5 + list_height;
     let detail_height = height.saturating_sub(detail_start + 4);
-    if let Some((category, index, entry)) = results.get(state.selected) {
-        let detail = wrap(
-            &format!(
-                "{}\n\n{}",
-                entry.command,
-                if entry.description.is_empty() {
-                    "No description yet. Ctrl+E to add one."
-                } else {
-                    &entry.description
-                }
-            ),
-            width,
-        );
+    if let Some((category, _, entry)) = results.get(state.selected) {
+        let detail = wrap(&entry_details(entry), width);
         state.detail_offset = state
             .detail_offset
             .min(detail.len().saturating_sub(detail_height));
@@ -573,8 +681,7 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
             &mut output,
             detail_start - 1,
             &format!(
-                "── {category} #{} · detail {}/{} · PgUp/PgDn scroll",
-                index + 1,
+                "── [{category}] · detail {}/{} · PgUp/PgDn scroll",
                 state.detail_offset + 1,
                 detail.len()
             ),
@@ -606,10 +713,12 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
     row(
         &mut output,
         height - 2,
-        if width < 58 {
-            "↑↓ Select · Enter Copy · F1 Help"
+        if selection_title.is_some() {
+            "↑↓ Select · Enter Choose · Esc Cancel"
+        } else if width < 58 {
+            "↑↓ Select · Enter Details · F1 Help"
         } else {
-            "↑↓ Select · Enter Copy · Ctrl+A Add · Ctrl+E Edit · F1 Help"
+            "↑↓ Select · Enter Details · Ctrl+A Add · Ctrl+E Edit · F1 Help"
         },
         width,
         true,
@@ -618,7 +727,9 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
     row(
         &mut output,
         height - 1,
-        if width < 58 {
+        if selection_title.is_some() {
+            "Type to filter · Ctrl+U Clear · F1 Help"
+        } else if width < 58 {
             "Esc Quit · ^A Add · ^E Edit · F1 Help"
         } else {
             "Esc Quit · Ctrl+U Clear · Ctrl+D Remove · Ctrl+Z Undo · F1 Help"
@@ -629,6 +740,76 @@ Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit
     )?;
     let cursor_x = (9 + state.query[search_start..state.cursor].width()).min(width);
     queue!(output, cursor::MoveTo(cursor_x as u16, 2), cursor::Show)?;
+    output.flush()?;
+    Ok(())
+}
+
+fn entry_details(entry: &CommandEntry) -> String {
+    format!(
+        "Command\n{}\n\nDescription\n{}",
+        entry.command,
+        if entry.description.is_empty() {
+            "No description yet. Add one when editing."
+        } else {
+            &entry.description
+        }
+    )
+}
+
+fn render_details(
+    output: &mut impl Write,
+    category: &str,
+    entry: &CommandEntry,
+    state: &mut State,
+    width: usize,
+    height: usize,
+    color: bool,
+) -> Result<()> {
+    row(
+        output,
+        0,
+        &format!("Command details · [{category}]"),
+        width,
+        true,
+        color,
+    )?;
+    let lines = wrap(&entry_details(entry), width);
+    let visible = height.saturating_sub(7);
+    state.detail_offset = state.detail_offset.min(lines.len().saturating_sub(visible));
+    for (i, line) in lines
+        .iter()
+        .skip(state.detail_offset)
+        .take(visible)
+        .enumerate()
+    {
+        result_row(output, i + 2, line, width, false, color, &state.query)?;
+    }
+    row(output, height - 4, &state.message, width, false, color)?;
+    row(
+        output,
+        height - 3,
+        "c Copy · e Edit · d Remove",
+        width,
+        true,
+        color,
+    )?;
+    row(
+        output,
+        height - 2,
+        "m Move · n Rename · u Undo",
+        width,
+        false,
+        color,
+    )?;
+    row(
+        output,
+        height - 1,
+        "Esc Back · ↑↓ Scroll · ? Help",
+        width,
+        false,
+        color,
+    )?;
+    queue!(output, cursor::Hide)?;
     output.flush()?;
     Ok(())
 }

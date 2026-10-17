@@ -84,6 +84,14 @@ pub fn save(path: &Path, config: &Config) -> Result<()> {
 /// `rename` when it is saved. Locking the replaced file itself would not
 /// coordinate processes that opened it before and after the rename.
 pub fn update<T>(path: &Path, operation: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+    update_with_backup(path, operation, true)
+}
+
+fn update_with_backup<T>(
+    path: &Path,
+    operation: impl FnOnce(&mut Config) -> Result<T>,
+    record_backup: bool,
+) -> Result<T> {
     let parent = path
         .parent()
         .ok_or_else(|| {
@@ -131,12 +139,14 @@ pub fn update<T>(path: &Path, operation: impl FnOnce(&mut Config) -> Result<T>) 
     let result = operation(&mut config)?;
     if config != before {
         validate_config(&config).map_err(Error)?;
-        let record = UndoRecord {
-            before,
-            after: config.clone(),
-        };
-        let yaml = yaml_serde::to_string(&record).map_err(|e| Error(e.to_string()))?;
-        save_text_atomically(&undo_path(path), &yaml)?;
+        if record_backup {
+            let record = UndoRecord {
+                before,
+                after: config.clone(),
+            };
+            let yaml = yaml_serde::to_string(&record).map_err(|e| Error(e.to_string()))?;
+            save_text_atomically(&undo_path(path), &yaml)?;
+        }
         save(path, &config)?;
     }
     Ok(result)
@@ -154,17 +164,27 @@ fn undo_path(path: &Path) -> PathBuf {
 
 /// The snapshot is checked under the normal write lock; external edits are never overwritten.
 pub fn undo(path: &Path) -> Result<()> {
-    update(path, |current| {
-        let yaml = fs::read_to_string(undo_path(path)).map_err(|_| Error("No saved change to undo. A backup is created when you add, edit, move or remove data.".into()))?;
-        let record: UndoRecord = yaml_serde::from_str(&yaml)
-            .map_err(|e| Error(format!("The undo backup could not be read: {e}")))?;
-        validate_config(&record.before).map_err(Error)?;
-        if *current != record.after {
-            return Err(Error("The configuration changed outside cmdnavi. Nothing was overwritten; inspect the .yaml.undo backup manually.".into()));
-        }
-        *current = record.before;
-        Ok(())
-    })
+    update_with_backup(
+        path,
+        |current| {
+            let yaml = fs::read_to_string(undo_path(path)).map_err(|_| Error("No saved change to undo. A backup is created when you add, edit, move or remove data.".into()))?;
+            let record: UndoRecord = yaml_serde::from_str(&yaml)
+                .map_err(|e| Error(format!("The undo backup could not be read: {e}")))?;
+            validate_config(&record.before).map_err(Error)?;
+            if *current == record.before {
+                return Err(Error(
+                    "The last change is already undone. There are no further changes to undo."
+                        .into(),
+                ));
+            }
+            if *current != record.after {
+                return Err(Error("The configuration changed outside cmdnavi. Nothing was overwritten; inspect the .yaml.undo backup manually.".into()));
+            }
+            *current = record.before;
+            Ok(())
+        },
+        false,
+    )
 }
 
 fn save_text_atomically(path: &Path, contents: &str) -> Result<()> {

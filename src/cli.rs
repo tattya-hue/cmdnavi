@@ -7,33 +7,40 @@ use std::path::Path;
 pub const HELP: &str = "cmdnavi - your personal command reference
 
 Usage:
-  cmdnavi                         Browse and search (↑↓ select, F1 help)
-  cmdnavi <category>               Show numbered commands and descriptions
+  cmdnavi                         Browse; type to search, Enter for details
   cmdnavi add [category] [\"command\"] [\"description\"]
-  cmdnavi edit [category] [item]    YAML editing, or edit one selected item
-  cmdnavi remove <category> [item]  Select a command and confirm removal
-  cmdnavi list                     List category names
+  cmdnavi edit [category]          Choose a command and edit its fields
+  cmdnavi remove [category]        Choose a command and confirm removal
+  cmdnavi list                     List categories
+  cmdnavi <category>               Show saved commands
 
 Options:
-  --show <category> [item]          Show a category or one item (also leading '-')
-  --print <category> <item>         Output only the command text
-  --copy <category> [item]          Copy a command, never execute it
-  --move <category> <item> <target> Move a command to another category
-  --rename-category <old> <new>     Rename a category
-  --remove-category <category>     Confirm removal of a category and its commands
-  --undo                          Undo last change; repeat to redo
-  --config-path                   Show where commands are saved
-  --browse                        Open the interactive browser
-  --search <text>                  Search using all words, across all fields
-  --completions <shell>            Shell setup: bash, zsh, fish, powershell
-  -h, --help                      Show help (also: add --help, edit --help)
-  -v, --version                   Show version
+  --search <text>                  Search across categories, commands and descriptions
+  --undo                          Undo the last saved change once
+  -h, --help                      Show this help
+  --help-all                      Show organization, setup and YAML editing options
 
-An item is a 1-based number or an exact saved command, quoted if it contains spaces.
-Tab completion is context-specific; description/search fields have no command completion.
-Interactive add: filter categories; /back edits the command, /category changes its category at the description prompt.
-Category names accept Japanese and other letters, digits, '_' and '-'.
-Use `cmdnavi --completions bash` to print the Bash integration; see README for setup.
+For an operation's help: cmdnavi add --help, cmdnavi edit --help.
+";
+
+pub const ADVANCED_HELP: &str = "
+Organization and output:
+  --show <category> [item]         Show a category or one item
+  --print <category> <item>        Output only the command text
+  --copy <category> [item]         Copy command text only to the clipboard
+  --move [category]               Choose a command, then its destination
+  --rename-category <old> <new>    Rename a category
+  --remove-category <category>    Confirm removal of a category and its commands
+
+Setup and file editing:
+  --edit-yaml [category]           Open YAML in VISUAL/EDITOR
+  --config-path                    Show the saved data location
+  --completions <shell>            Print setup for bash, zsh, fish or powershell
+  -v, --version                    Show version
+
+For scripts: --move <source> <item> <target>.
+An item is a 1-based number or an exact saved command (quote spaces).
+YAML editing is for bulk changes; ordinary edit uses an input form.
 ";
 
 pub fn run(
@@ -57,7 +64,8 @@ pub fn run_with_terminal(
 pub fn run_metadata(args: &[String], output: &mut dyn Write) -> Option<Result<()>> {
     let strings: Vec<_> = args.iter().map(String::as_str).collect();
     match strings.as_slice() {
-        ["--completions", _] | ["-h" | "--help" | "help" | "-v" | "--version" | "version"] => {}
+        ["--completions", _]
+        | ["-h" | "--help" | "--help-all" | "help" | "-v" | "--version" | "version"] => {}
         [action, "-h" | "--help"] if completion::ACTIONS.contains(action) => {}
         _ => return None,
     }
@@ -69,6 +77,7 @@ pub fn run_metadata(args: &[String], output: &mut dyn Write) -> Option<Result<()
                 write!(output, "{script}")?;
             }
             ["-h" | "--help" | "help"] => write!(output, "{HELP}")?,
+            ["--help-all"] => write!(output, "{HELP}{ADVANCED_HELP}")?,
             ["-v" | "--version" | "version"] => {
                 writeln!(output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
             }
@@ -165,10 +174,7 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
         ["--config-path"] => writeln!(s.output, "{}", path.display())?,
         ["--undo"] => {
             config::undo(path)?;
-            writeln!(
-                s.output,
-                "Last change undone. Repeat `cmdnavi --undo` to redo."
-            )?;
+            writeln!(s.output, "Last change undone.")?;
         }
         ["list"] => list(path, s.output)?,
         ["add"] => {
@@ -197,8 +203,10 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
             true,
             s,
         )?,
-        ["edit"] => editor::edit_all_interactive(path, &editor::ExternalEditor, s.input, s.output)?,
-        ["edit", category] => {
+        ["--edit-yaml"] => {
+            editor::edit_all_interactive(path, &editor::ExternalEditor, s.input, s.output)?
+        }
+        ["--edit-yaml", category] => {
             validate_category(category).map_err(Error)?;
             editor::edit_category_interactive(
                 path,
@@ -208,22 +216,41 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
                 s.output,
             )?;
         }
+        ["edit"] => {
+            if let Some(category) = interaction::choose_existing_category_with(path, s)? {
+                edit_selected(path, &category, s)?;
+            }
+        }
+        ["edit", category] => edit_selected(path, category, s)?,
         ["edit", category, item] => {
             let entries = entries(path, category)?;
             let i = interaction::resolve_item(&entries, item)?;
             interaction::edit_entry_with(path, category, i, &entries, s)?;
         }
-        ["remove" | "--copy", category] => {
-            let entries = entries(path, category)?;
-            if let Some(i) = interaction::pick_entry(category, &entries, s)? {
-                if strings[0] == "remove" {
-                    interaction::remove_entry(path, category, i, &entries, s)?;
-                } else {
-                    clipboard::copy(&entries[i].command)?;
-                    writeln!(s.output, "Copied command from [{category}].")?;
-                }
+        ["remove"] => {
+            if let Some(category) = interaction::choose_existing_category_with(path, s)? {
+                remove_selected(path, &category, s)?;
             }
         }
+        ["remove", category] => remove_selected(path, category, s)?,
+        ["--copy", category] => {
+            let entries = entries(path, category)?;
+            if let Some(i) =
+                interaction::pick_entry_for(category, &entries, s, "Choose a command to copy")?
+            {
+                clipboard::copy(&entries[i].command)?;
+                writeln!(
+                    s.output,
+                    "Copied command text from [{category}] to the clipboard."
+                )?;
+            }
+        }
+        ["--move"] => {
+            if let Some(category) = interaction::choose_existing_category_with(path, s)? {
+                move_selected(path, &category, s)?;
+            }
+        }
+        ["--move", source] => move_selected(path, source, s)?,
         ["remove" | "--copy", category, item] => {
             let entries = entries(path, category)?;
             let i = interaction::resolve_item(&entries, item)?;
@@ -277,7 +304,7 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
                 write_entry(s.output, &entries[i])?;
             }
         }
-        ["remove" | "--copy" | "--show" | "--print"] => {
+        ["--copy" | "--show" | "--print"] => {
             return Err(Error(format!(
                 "`{}` needs a category.\nTry `cmdnavi {} network` or `cmdnavi --help`.",
                 strings[0], strings[0]
@@ -285,7 +312,7 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
         }
         [option] if option.starts_with('-') => {
             return Err(Error(format!(
-                "unknown option \"{option}\".\nRun `cmdnavi --help` for supported options."
+                "unknown option \"{option}\".\nRun `cmdnavi --help-all` for supported options."
             )));
         }
         [category] => show(path, category, s.output)?,
@@ -303,16 +330,64 @@ fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
     Ok(())
 }
 
+fn edit_selected(path: &Path, category: &str, session: &mut Session<'_>) -> Result<()> {
+    let entries = entries(path, category)?;
+    if let Some(index) =
+        interaction::pick_entry_for(category, &entries, session, "Choose a command to edit")?
+    {
+        interaction::edit_entry_with(path, category, index, &entries, session)?;
+    }
+    Ok(())
+}
+
+fn remove_selected(path: &Path, category: &str, session: &mut Session<'_>) -> Result<()> {
+    let entries = entries(path, category)?;
+    if let Some(index) =
+        interaction::pick_entry_for(category, &entries, session, "Choose a command to remove")?
+    {
+        interaction::remove_entry(path, category, index, &entries, session)?;
+    }
+    Ok(())
+}
+
+fn move_selected(path: &Path, source: &str, session: &mut Session<'_>) -> Result<()> {
+    let entries = entries(path, source)?;
+    if let Some(index) =
+        interaction::pick_entry_for(source, &entries, session, "Choose a command to move")?
+    {
+        writeln!(
+            session.output,
+            "Move command: {}\nChoose its destination category.",
+            crate::session::visible(&entries[index].command)
+        )?;
+        if let Some(target) = interaction::choose_destination_with(path, source, session)? {
+            if target == source {
+                writeln!(
+                    session.output,
+                    "No changes. This command is already in [{source}]."
+                )?;
+                return Ok(());
+            }
+            interaction::move_entry(path, source, index, &entries, &target)?;
+            writeln!(
+                session.output,
+                "Moved command from [{source}] to [{target}]."
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn action_help(action: &str, output: &mut dyn Write) -> Result<()> {
     let text = match action {
         "add" => {
-            "cmdnavi add [category] [\"command\"] [\"description\"]\nChoose/create a category; Tab completes categories only here. The command field completes saved commands in that category. Description has no completion. Enter skips the description; Ctrl+C or /cancel cancels.\nIn a terminal, filter categories by any part of the name, then use Up/Down and Enter. At the description prompt, /back edits the command and /category changes its category without losing the command.\nMultiline paste is supported in a terminal. In scripts, pass quoted arguments. Omitting description preserves an existing description."
+            "cmdnavi add [category] [\"command\"] [\"description\"]\nChoose a category and enter a command; the description is optional. Tab completes the current field. Ctrl+C or /cancel cancels.\nAt the description prompt, /back edits the command and /category changes the category. In scripts, use quoted arguments."
         }
         "edit" => {
-            "cmdnavi edit [category] [item]\nWithout an item, edit YAML using VISUAL/EDITOR. With a number or quoted saved command, edit that item with the current values prefilled. Tab completes items only after the category. Ctrl+C or /cancel cancels."
+            "cmdnavi edit [category] [item]\nChoose a category and saved command, then edit the prefilled fields. A supplied item skips selection. Enter keeps current values; /clear clears the description. Ctrl+C or /cancel cancels.\nFor bulk YAML editing: cmdnavi --edit-yaml [category]."
         }
         "remove" => {
-            "cmdnavi remove <category> [item]\nChoose a number or exact saved command; Tab completes items after the category. Removal requires y/yes. Enter, q or Ctrl+C at selection cancels. `cmdnavi --undo` restores the last change."
+            "cmdnavi remove [category]\nChoose an existing category, then find the command by its text or description. Up/Down selects and Enter chooses it. Removal requires y/yes. Esc or Ctrl+C at selection cancels. `cmdnavi --undo` restores the last change."
         }
         _ => {
             "cmdnavi list\nPrint category names only, one per line, suitable for scripts. `cmdnavi` opens the browser; --config-path prints the data location."
@@ -388,7 +463,7 @@ pub fn overview(path: &Path, output: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         output,
-        "\nView: cmdnavi --show <category>\nBrowse: cmdnavi --browse\nSearch: cmdnavi --search <text>\nHelp: cmdnavi --help\nSaved data: {}",
+        "\nView: cmdnavi <category>\nBrowse: cmdnavi\nSearch: cmdnavi --search <text>\nHelp: cmdnavi --help\nSaved data: {}",
         path.display()
     )?;
     Ok(())
@@ -523,7 +598,7 @@ mod tests {
         let path = dir.path().join("config.yaml");
         let mut input = Cursor::new("");
 
-        let missing = run(&["remove".into()], &path, &mut input, &mut Vec::new())
+        let missing = run(&["--print".into()], &path, &mut input, &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(missing.contains("needs a category"));

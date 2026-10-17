@@ -117,8 +117,8 @@ def run(root):
     # Numeric command text completes to a real item reference in the picker.
     t = Terminal([BINARY, 'remove', 'numeric'], env)
     try:
-        t.expect('Select item')
-        t.send('99\t\n')
+        t.expect('Choose a command to remove')
+        t.send('99\n')
         t.expect('Remove "99"?')
         t.send('n\n')
         t.finish()
@@ -165,6 +165,78 @@ def run(root):
         t.close()
         raise
     assert 'cancelled' not in cli('list').splitlines()
+
+    # Ordinary edit only selects saved categories, and Up cannot replace a field
+    # with a different saved command masquerading as input history.
+    cli('add', 'historycheck', 'echo first', 'first')
+    cli('add', 'historycheck', 'echo second', 'second')
+    t = Terminal([BINARY, 'edit'], env)
+    try:
+        t.expect('Category (name')
+        t.send('not-saved')
+        t.expect('No matching categories.')
+        t.send('\x15historycheck\n')
+        t.expect('Choose a command to edit')
+        t.send('echo first\n')
+        t.expect('New command:')
+        t.send('\x1b[A\n')
+        t.expect('New description')
+        t.send('\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('historycheck') == 'echo first'
+    assert cli('--print', 'historycheck', '2') == 'echo second'
+    assert 'not-saved' not in cli('list').splitlines()
+
+    # Select by description instead of an ordinal, then choose the destination.
+    cli('add', 'selection', 'echo alpha', 'backup server')
+    cli('add', 'selection', 'echo beta', 'database maintenance')
+    t = Terminal([BINARY, '--move', 'selection'], env)
+    try:
+        t.expect('Choose a command to move')
+        t.send('maintenance\n')
+        t.expect('Choose destination')
+        t.expect('Category (name')
+        t.send('destination\n')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('selection') == 'echo alpha'
+    assert entry('destination') == 'echo beta'
+
+    # Leaving the destination chooser must not remove or duplicate the source.
+    t = Terminal([BINARY, '--move', 'selection'], env)
+    try:
+        t.expect('Choose a command to move')
+        t.send('backup\n')
+        t.expect('Category (name')
+        t.send('\x1b')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+    assert entry('selection') == 'echo alpha'
+
+    # Removal chooses a category and command by name/description, then confirms.
+    for confirmation in ['n', 'y']:
+        t = Terminal([BINARY, 'remove'], env)
+        try:
+            t.expect('Category (name')
+            t.send('destination\n')
+            t.expect('Choose a command to remove')
+            t.send('database\n')
+            t.expect('Remove "echo beta"?')
+            t.send(confirmation + '\n')
+            t.finish()
+        except BaseException:
+            t.close()
+            raise
+        if confirmation == 'n':
+            assert entry('destination') == 'echo beta'
+    assert 'No commands yet' in cli('--show', 'destination')
 
     # Substring category selection and going back keep the command until final save.
     t = Terminal([BINARY, 'add'], env)
@@ -226,6 +298,24 @@ def run(root):
         raise
     assert '未保存' not in cli('list').splitlines()
 
+    # Repeating Undo must never restore a command that was just undone.
+    cli('add', 'undocheck', 'echo temporary')
+    t = Terminal([BINARY], env)
+    try:
+        t.expect('F1 Help')
+        t.send('\x1a')
+        t.expect('Last change undone.')
+        t.send('\x1a')
+        t.expect('already undone')
+        assert 'undocheck' not in cli('list').splitlines()
+        t.send('\x1b')
+        t.expect('F1 Help')
+        t.send('\x1b')
+        t.finish()
+    except BaseException:
+        t.close()
+        raise
+
     t = Terminal([BINARY], env)
     try:
         t.expect('F1 Help')
@@ -253,7 +343,7 @@ def run(root):
     t = Terminal([BINARY], clipboard_env)
     try:
         t.expect('F1 Help')
-        t.send('\r')
+        t.send('\x19')
         t.expect('Copying')
         start = time.monotonic()
         t.send('\x1b')
