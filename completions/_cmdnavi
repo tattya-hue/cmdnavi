@@ -1,0 +1,18 @@
+#compdef cmdnavi
+_cmdnavi() {
+    local -a candidates tokens
+    local response
+    tokens=("${(@Q)words[2,-1]}")
+    tokens[$((CURRENT - 1))]=$PREFIX
+    response=$(command cmdnavi --complete zsh "$((CURRENT - 2))" -- "${tokens[@]}" 2>/dev/null)
+    [[ -z $response ]] && return 1
+    candidates=("${(@0)response}")
+    candidates=("${(@)candidates:#}")
+    (( ${#candidates} )) || return 1
+    if [[ -n ${compstate[quote]} && -z $QISUFFIX ]]; then
+        compadd -U -S "${compstate[quote]} " -- "${candidates[@]}"
+    else
+        compadd -U -- "${candidates[@]}"
+    fi
+}
+compdef _cmdnavi cmdnavi

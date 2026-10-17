@@ -1,5 +1,7 @@
-//! Keyboard-driven browser. Stored command strings are never executed.
-use crate::model::{CommandEntry, Config};
+//! Keyboard-driven browser. Stored commands are data, never executable code.
+use crate::completion::Context;
+use crate::model::{CommandEntry, Config, matches_query};
+use crate::session::Session;
 use crate::{Result, clipboard, config, interaction};
 use crossterm::{
     cursor,
@@ -10,7 +12,9 @@ use crossterm::{
 };
 use std::io::{self, Write};
 use std::path::Path;
-use unicode_width::UnicodeWidthChar;
+use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 struct Screen;
 impl Screen {
@@ -20,7 +24,6 @@ impl Screen {
         execute!(
             io::stdout(),
             EnterAlternateScreen,
-            cursor::Hide,
             event::EnableBracketedPaste
         )?;
         Ok(screen)
@@ -43,105 +46,218 @@ impl Drop for Screen {
 #[derive(Default)]
 struct State {
     query: String,
+    cursor: usize,
     selected: usize,
     detail_offset: usize,
     message: String,
+    help: bool,
+    help_offset: usize,
 }
-
+impl State {
+    fn insert(&mut self, value: &str) {
+        self.query.insert_str(self.cursor, value);
+        self.cursor += value.len();
+        self.changed();
+    }
+    fn previous(&self) -> usize {
+        self.query[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+    fn next(&self) -> usize {
+        self.query[self.cursor..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(i, _)| self.cursor + i)
+            .unwrap_or(self.query.len())
+    }
+    fn changed(&mut self) {
+        self.selected = 0;
+        self.detail_offset = 0;
+    }
+    fn clear(&mut self) {
+        self.query.clear();
+        self.cursor = 0;
+        self.changed();
+    }
+}
 fn matches<'a>(data: &'a Config, query: &str) -> Vec<(&'a str, usize, &'a CommandEntry)> {
-    let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     data.iter()
         .flat_map(|(category, entries)| {
             entries
                 .iter()
                 .enumerate()
-                .map(move |(index, entry)| (category.as_str(), index, entry))
+                .map(move |(i, e)| (category.as_str(), i, e))
         })
-        .filter(|(category, _, entry)| {
-            let haystack =
-                format!("{category}\n{}\n{}", entry.command, entry.description).to_lowercase();
-            terms.iter().all(|term| haystack.contains(term))
-        })
+        .filter(|(category, _, entry)| matches_query(category, entry, query))
         .collect()
+}
+fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+fn reload(path: &Path, data: &mut Config, state: &mut State) {
+    let selected = matches(data, &state.query)
+        .get(state.selected)
+        .map(|(c, _, e)| (c.to_string(), e.command.clone()));
+    match config::load(path) {
+        Ok(new) => {
+            *data = new;
+            if let Some((category, command)) = selected
+                && let Some(i) = matches(data, &state.query)
+                    .iter()
+                    .position(|(c, _, e)| *c == category && e.command == command)
+            {
+                state.selected = i;
+            }
+        }
+        Err(error) => {
+            state.message = format!("Reload failed. Keeping the last readable data.\n{error}");
+            state.help = true;
+            state.help_offset = 0;
+        }
+    }
 }
 
 pub fn run(path: &Path) -> Result<()> {
     let mut data = config::load(path)?;
+    let mut known_stamp = stamp(path);
     let mut state = State::default();
     let mut screen = Screen::enter()?;
+    let mut copying: Option<std::sync::mpsc::Receiver<Result<()>>> = None;
+    let mut dirty = true;
     loop {
+        if known_stamp != stamp(path) {
+            reload(path, &mut data, &mut state);
+            known_stamp = stamp(path);
+            dirty = true;
+        }
+        if let Some(receiver) = &copying
+            && let Ok(result) = receiver.try_recv()
+        {
+            match result {
+                Ok(()) => state.message = "Copied command to clipboard.".into(),
+                Err(error) => {
+                    state.message = error.to_string();
+                    state.help = true;
+                    state.help_offset = 0;
+                }
+            }
+            copying = None;
+            dirty = true;
+        }
         let results = matches(&data, &state.query);
         state.selected = state.selected.min(results.len().saturating_sub(1));
-        render(&data, &results, &mut state)?;
+        if dirty {
+            render(&data, &results, &mut state)?;
+            dirty = false;
+        }
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+        dirty = true;
         let key = match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
-            Event::Paste(text) => {
-                state.query.extend(text.chars().filter(|c| !c.is_control()));
-                state.selected = 0;
-                state.detail_offset = 0;
+            Event::Paste(text) if !state.help => {
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                state.insert(&text);
                 continue;
             }
             _ => continue,
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if state.help {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => state.help = false,
+                KeyCode::Char('c') if ctrl => break,
+                KeyCode::Up => state.help_offset = state.help_offset.saturating_sub(1),
+                KeyCode::Down => state.help_offset = state.help_offset.saturating_add(1),
+                KeyCode::PageUp => state.help_offset = state.help_offset.saturating_sub(8),
+                KeyCode::PageDown => state.help_offset = state.help_offset.saturating_add(8),
+                _ => {}
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => break,
-            KeyCode::Char('a' | 'e') if ctrl => {
-                let editing = key.code == KeyCode::Char('e');
+            KeyCode::F(1) => {
+                state.help = true;
+                state.help_offset = 0;
+            }
+            KeyCode::Char('r') if ctrl => {
+                reload(path, &mut data, &mut state);
+                known_stamp = stamp(path);
+                state.message = "Reloaded.".into();
+            }
+            KeyCode::Char('z') if ctrl => match config::undo(path) {
+                Ok(()) => {
+                    reload(path, &mut data, &mut state);
+                    state.message = "Last change undone. Ctrl+Z again redoes it.".into();
+                }
+                Err(error) => {
+                    state.message = error.to_string();
+                    state.help = true;
+                    state.help_offset = 0;
+                }
+            },
+            KeyCode::Char('a' | 'e' | 'd' | 'g' | 'n') if ctrl => {
                 let selected = results
                     .get(state.selected)
-                    .map(|(category, index, _)| (category.to_string(), *index));
-                if editing && selected.is_none() {
+                    .map(|(c, i, _)| (c.to_string(), *i));
+                if key.code != KeyCode::Char('a') && selected.is_none() {
+                    state.message = "Select a command first, or Ctrl+A to add one.".into();
                     continue;
                 }
+                let before = data.clone();
                 drop(screen);
                 let stdin = io::stdin();
                 let stdout = io::stdout();
                 let mut input = stdin.lock();
                 let mut output = stdout.lock();
-                let result = if editing {
-                    let (category, index) = selected.unwrap();
-                    interaction::edit_entry(
-                        path,
-                        &category,
-                        index,
-                        &data[&category],
-                        &mut input,
-                        &mut output,
-                    )
-                } else {
-                    interaction::choose_category(path, &mut input, &mut output).and_then(
-                        |category| {
-                            if let Some(category) = category {
-                                interaction::add(path, &category, &mut input, &mut output)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )
-                };
-                if let Err(error) = &result {
-                    writeln!(output, "{error}")?;
-                }
-                write!(output, "Press Enter to return to the browser: ")?;
-                output.flush()?;
-                let _ = crate::cli::read_line(&mut input)?;
+                let mut session = Session::new(&mut input, &mut output, true);
+                let result = perform_action(path, key.code, selected, &data, &mut session);
                 drop(output);
                 drop(input);
-                data = config::load(path)?;
-                state.message = if result.is_ok() {
-                    "Ready.".into()
-                } else {
-                    "No changes saved. Try again with Ctrl+E or Ctrl+A.".into()
-                };
+                reload(path, &mut data, &mut state);
+                known_stamp = stamp(path);
+                match result {
+                    Ok(()) => {
+                        let changed = before != data;
+                        state.message = if changed {
+                            "Saved. Ctrl+Z undoes the last change."
+                        } else {
+                            "No changes."
+                        }
+                        .into();
+                        if changed
+                            && !state.query.is_empty()
+                            && matches(&data, &state.query).is_empty()
+                        {
+                            state.clear();
+                            state.message =
+                                "Search cleared to show saved changes. Ctrl+Z undoes changes."
+                                    .into();
+                        }
+                    }
+                    Err(error) => {
+                        state.message = error.to_string();
+                        state.help = true;
+                        state.help_offset = 0;
+                    }
+                }
                 screen = Screen::enter()?;
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if copying.is_none() => {
                 if let Some((_, _, entry)) = results.get(state.selected) {
-                    state.message = match clipboard::copy(&entry.command) {
-                        Ok(()) => "Copied command to clipboard.".into(),
-                        Err(error) => error.to_string(),
-                    };
+                    let text = entry.command.clone();
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = sender.send(clipboard::copy(&text));
+                    });
+                    copying = Some(receiver);
+                    state.message = "Copying… Esc exits without waiting.".into();
                 }
             }
             KeyCode::Up => {
@@ -154,20 +270,23 @@ pub fn run(path: &Path) -> Result<()> {
             }
             KeyCode::PageUp => state.detail_offset = state.detail_offset.saturating_sub(3),
             KeyCode::PageDown => state.detail_offset = state.detail_offset.saturating_add(3),
-            KeyCode::Char('u') if ctrl => {
-                state.query.clear();
-                state.selected = 0;
-                state.detail_offset = 0;
-            }
+            KeyCode::Left => state.cursor = state.previous(),
+            KeyCode::Right => state.cursor = state.next(),
+            KeyCode::Home => state.cursor = 0,
+            KeyCode::End => state.cursor = state.query.len(),
+            KeyCode::Char('u') if ctrl => state.clear(),
             KeyCode::Backspace => {
-                state.query.pop();
-                state.selected = 0;
-                state.detail_offset = 0;
+                let previous = state.previous();
+                state.query.replace_range(previous..state.cursor, "");
+                state.cursor = previous;
+                state.changed();
+            }
+            KeyCode::Delete => {
+                state.query.replace_range(state.cursor..state.next(), "");
+                state.changed();
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                state.query.push(c);
-                state.selected = 0;
-                state.detail_offset = 0;
+                state.insert(&c.to_string())
             }
             _ => {}
         }
@@ -175,6 +294,45 @@ pub fn run(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn perform_action(
+    path: &Path,
+    key: KeyCode,
+    selected: Option<(String, usize)>,
+    data: &Config,
+    s: &mut Session<'_>,
+) -> Result<()> {
+    if key == KeyCode::Char('a') {
+        if let Some(category) = interaction::choose_category_with(path, s)? {
+            interaction::add_with(path, &category, s)?;
+        }
+        return Ok(());
+    }
+    let (category, index) = selected.unwrap();
+    match key {
+        KeyCode::Char('e') => {
+            interaction::edit_entry_with(path, &category, index, &data[&category], s)
+        }
+        KeyCode::Char('d') => {
+            interaction::remove_entry(path, &category, index, &data[&category], s)
+        }
+        KeyCode::Char('g') => {
+            writeln!(s.output, "Move the selected command from [{category}].")?;
+            if let Some(target) = interaction::choose_category_with(path, s)? {
+                interaction::move_entry(path, &category, index, &data[&category], &target)?;
+            }
+            Ok(())
+        }
+        KeyCode::Char('n') => {
+            if let Some(name) =
+                s.ask("New category name: ", &category, Context::Categories, data)?
+            {
+                crate::cli::rename_category(path, &category, &name, &data[&category])?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
 // Strip controls so pasted/stored text cannot move the terminal cursor.
 fn clean(text: &str) -> String {
     text.chars()
@@ -185,9 +343,9 @@ fn clean(text: &str) -> String {
 fn clip(text: &str, width: usize) -> String {
     let text = clean(text);
     let mut used = 0;
-    text.chars()
-        .take_while(|c| {
-            used += c.width().unwrap_or(0);
+    text.graphemes(true)
+        .take_while(|g| {
+            used += g.width();
             used <= width
         })
         .collect()
@@ -196,15 +354,16 @@ fn clip(text: &str, width: usize) -> String {
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for line in text.lines() {
+        let text = clean(line);
         let mut current = String::new();
         let mut used = 0;
-        for c in clean(line).chars() {
-            let size = c.width().unwrap_or(0);
+        for grapheme in text.graphemes(true) {
+            let size = grapheme.width();
             if used + size > width && !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
                 used = 0;
             }
-            current.push(c);
+            current.push_str(grapheme);
             used += size;
         }
         lines.push(current);
@@ -247,6 +406,29 @@ fn render(
     let color = std::env::var_os("NO_COLOR").is_none();
     let mut output = io::stdout().lock();
     queue!(output, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+    if state.help && height >= 4 && width >= 10 {
+        let text = format!(
+            "{}\n\nKeyboard help\nType to search (all words, case-insensitive).\nLeft/Right, Home/End, Delete: edit search.\nUp/Down: select item. PgUp/PgDn: scroll details.\nEnter: copy (never execute).\nCtrl+A: add; Ctrl+E: edit; Ctrl+D: remove.\nCtrl+G: move item; Ctrl+N: rename category.\nCtrl+Z: undo / redo last change.\nCtrl+R: reload (external changes also refresh automatically).\nCtrl+U: clear search; Esc / Ctrl+C: exit.\nF1: help and full status message.\n\nForms: Left/Right edit; Tab completes only the current field.\nCategory fields: category candidates only.\nCommand fields: commands from that category only.\nDescription/confirmation/search: no command completion.\nCtrl+C or /cancel cancels forms; Enter accepts current values.\nMultiline paste stays in the current field.\n\nCLI: --show, --print, --copy, --move, --rename-category,\n--remove-category, --undo, --config-path. See --help.\n\nNo persistent input-history file is written.\n",
+            state.message
+        );
+        let lines = wrap(&text, width);
+        let count = height.saturating_sub(2);
+        state.help_offset = state.help_offset.min(lines.len().saturating_sub(count));
+        for (i, line) in lines.iter().skip(state.help_offset).take(count).enumerate() {
+            row(&mut output, i, line, width, false, color)?;
+        }
+        row(
+            &mut output,
+            height - 1,
+            "↑↓/PgUp/PgDn Scroll · Esc/Enter Close",
+            width,
+            true,
+            color,
+        )?;
+        queue!(output, cursor::Hide)?;
+        output.flush()?;
+        return Ok(());
+    }
     if height < 12 || width < 35 {
         row(
             &mut output,
@@ -271,10 +453,19 @@ fn render(
         true,
         color,
     )?;
+    let mut search_start = 0;
+    let available = width.saturating_sub(10);
+    while state.query[search_start..state.cursor].width() > available {
+        search_start += state.query[search_start..]
+            .graphemes(true)
+            .next()
+            .map(str::len)
+            .unwrap_or(1);
+    }
     row(
         &mut output,
         2,
-        &format!("Search > {}", state.query),
+        &format!("Search > {}", &state.query[search_start..]),
         width,
         true,
         color,
@@ -361,7 +552,11 @@ fn render(
     row(
         &mut output,
         height - 2,
-        "↑↓ Select · Enter Copy · Ctrl+A Add · Ctrl+E Edit",
+        if width < 58 {
+            "↑↓ Select · Enter Copy · F1 Help"
+        } else {
+            "↑↓ Select · Enter Copy · Ctrl+A Add · Ctrl+E Edit · F1 Help"
+        },
         width,
         true,
         color,
@@ -369,11 +564,17 @@ fn render(
     row(
         &mut output,
         height - 1,
-        "Esc Quit · Ctrl+U Clear · PgUp/PgDn Detail",
+        if width < 58 {
+            "Esc Quit · ^A Add · ^E Edit · F1 Help"
+        } else {
+            "Esc Quit · Ctrl+U Clear · Ctrl+D Remove · Ctrl+Z Undo · F1 Help"
+        },
         width,
         false,
         color,
     )?;
+    let cursor_x = (9 + state.query[search_start..state.cursor].width()).min(width);
+    queue!(output, cursor::MoveTo(cursor_x as u16, 2), cursor::Show)?;
     output.flush()?;
     Ok(())
 }

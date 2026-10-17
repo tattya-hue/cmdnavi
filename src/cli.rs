@@ -1,38 +1,37 @@
-use crate::config;
-use crate::editor::{self, ExternalEditor};
-use crate::model::{CommandEntry, validate_category};
-use crate::{Error, Result};
+use crate::model::{CommandEntry, matches_query, validate_category};
+use crate::session::Session;
+use crate::{Error, Result, clipboard, completion, config, editor, interaction};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-pub const HELP: &str = "cmdnavi - manage your personal command reference
+pub const HELP: &str = "cmdnavi - your personal command reference
 
 Usage:
-  cmdnavi
-  cmdnavi <category>
+  cmdnavi                         Browse and search (↑↓ select, F1 help)
+  cmdnavi <category>               Show numbered commands and descriptions
   cmdnavi add [category] [\"command\"] [\"description\"]
-  cmdnavi edit [category] [item-number]
-  cmdnavi list
-  cmdnavi remove <category>
-
-Commands:
-  add       Add a command
-  edit      Edit registered commands
-  list      List categories
-  remove    Remove a command
+  cmdnavi edit [category] [item]    YAML editing, or edit one selected item
+  cmdnavi remove <category> [item]  Select a command and confirm removal
+  cmdnavi list                     List category names
 
 Options:
-  --browse        Browse, filter, copy and edit interactively
-  --search <text>  Search categories, commands and descriptions
-  -h, --help       Show help
-  -v, --version    Show version
+  --show <category> [item]          Show a category or one item (also leading '-')
+  --print <category> <item>         Output only the command text
+  --copy <category> [item]          Copy a command, never execute it
+  --move <category> <item> <target> Move a command to another category
+  --rename-category <old> <new>     Rename a category
+  --remove-category <category>     Confirm removal of a category and its commands
+  --undo                          Undo last change; repeat to redo
+  --config-path                   Show where commands are saved
+  --browse                        Open the interactive browser
+  --search <text>                  Search using all words, across all fields
+  --completions <shell>            Shell setup: bash, zsh, fish, powershell
+  -h, --help                      Show help (also: add --help, edit --help)
+  -v, --version                   Show version
 
-Examples:
-  cmdnavi add network
-  cmdnavi network
-  cmdnavi --search \"IP address\"
-
-Saved commands are displayed, never executed.
+An item is a 1-based number or an exact saved command, quoted if it contains spaces.
+Tab completion is context-specific; description/search fields have no command completion.
+Use `cmdnavi --completions bash` to print the Bash integration; see README for setup.
 ";
 
 pub fn run(
@@ -41,132 +40,282 @@ pub fn run(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<()> {
-    match args {
-        [] => overview(path, output)?,
-        [one] => match one.as_str() {
-            "-h" | "--help" | "help" => write!(output, "{HELP}")?,
-            "-v" | "--version" | "version" => {
-                writeln!(output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
+    run_with_terminal(args, path, input, output, false)
+}
+pub fn run_with_terminal(
+    args: &[String],
+    path: &Path,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    terminal: bool,
+) -> Result<()> {
+    dispatch(args, path, &mut Session::new(input, output, terminal))
+}
+fn dispatch(args: &[String], path: &Path, s: &mut Session<'_>) -> Result<()> {
+    let strings: Vec<_> = args.iter().map(String::as_str).collect();
+    match strings.as_slice() {
+        [] => overview(path, s.output)?,
+        ["--complete", shell, position, "--", ..] => {
+            let position = position
+                .parse::<usize>()
+                .map_err(|_| Error("Invalid completion position.".into()))?;
+            let mut words = args[4..].to_vec();
+            if let Some(word) = words.get_mut(position) {
+                *word = word
+                    .strip_prefix("__CMDNAVI_PREFIX__")
+                    .unwrap_or(word)
+                    .to_owned();
             }
-            "list" => list(path, output)?,
-            "--search" => {
-                return Err(Error(
-                    "search needs some text.\nTry `cmdnavi --search docker`.".into(),
-                ));
-            }
-            "edit" => editor::edit_all_interactive(path, &ExternalEditor, input, output)?,
-            "add" => {
-                if let Some(category) = crate::interaction::choose_category(path, input, output)? {
-                    add(path, &category, input, output)?;
+            let raw_prefix = words.get(position).cloned().unwrap_or_default();
+            if *shell == "bash" {
+                for word in &mut words {
+                    *word = completion::bash_word(word);
                 }
             }
-            "remove" => return Err(missing_category(one)),
-            option if option.starts_with('-') => {
-                return Err(Error(format!(
-                    "unknown option \"{option}\".\nRun `cmdnavi --help` and choose one of the supported options.\n\n{HELP}"
-                )));
+            let prefix = words.get(position).map(String::as_str).unwrap_or("");
+            let data = config::load(path).unwrap_or_default();
+            let values =
+                completion::candidates(&data, &completion::context(&words, position), prefix);
+            if *shell == "powershell" {
+                let values: Vec<_> = values.iter().map(|c| serde_json::json!({"value":c.value,"description":crate::session::visible(&c.description),"insert":completion::shell_quote(&c.value,shell)})).collect();
+                writeln!(
+                    s.output,
+                    "{}",
+                    serde_json::to_string(&values).map_err(|e| Error(e.to_string()))?
+                )?;
+            } else {
+                for item in values {
+                    let value = if *shell == "bash" {
+                        completion::bash_insertion(&item.value, &raw_prefix)
+                    } else {
+                        completion::shell_quote(&item.value, shell)
+                    };
+                    if *shell == "zsh" {
+                        write!(s.output, "{}\0", item.value)?;
+                    } else if *shell == "bash" {
+                        write!(s.output, "{value}\0")?;
+                    } else if *shell == "fish" {
+                        write!(
+                            s.output,
+                            "{}\t{}\0",
+                            item.value,
+                            crate::session::visible(&item.description)
+                        )?;
+                    } else {
+                        writeln!(s.output, "{value}")?;
+                    }
+                }
             }
-            category => show(path, category, output)?,
-        },
-        [action, category, command] if action == "add" => crate::interaction::save_entry(
+        }
+        ["--completions", shell] => {
+            let script = completion::script(shell)
+                .ok_or_else(|| Error("Choose bash, zsh, fish or powershell.".into()))?;
+            write!(s.output, "{script}")?;
+        }
+        ["-h" | "--help" | "help"] => write!(s.output, "{HELP}")?,
+        ["-v" | "--version" | "version"] => {
+            writeln!(s.output, "cmdnavi {}", env!("CARGO_PKG_VERSION"))?
+        }
+        [action, "-h" | "--help"] if completion::ACTIONS.contains(action) => {
+            action_help(action, s.output)?
+        }
+        ["--config-path"] => writeln!(s.output, "{}", path.display())?,
+        ["--undo"] => {
+            config::undo(path)?;
+            writeln!(
+                s.output,
+                "Last change undone. Repeat `cmdnavi --undo` to redo."
+            )?;
+        }
+        ["list"] => list(path, s.output)?,
+        ["add"] => {
+            if let Some(category) = interaction::choose_category_with(path, s)? {
+                interaction::add_with(path, &category, s)?;
+            }
+        }
+        ["add", category] => interaction::add_with(path, category, s)?,
+        ["add", category, command] => interaction::save_entry_with(
             path,
             category,
             CommandEntry {
-                command: command.clone(),
+                command: (*command).into(),
                 description: String::new(),
             },
-            input,
-            output,
+            false,
+            s,
         )?,
-        [action, category, command, description] if action == "add" => {
-            crate::interaction::save_entry(
+        ["add", category, command, description] => interaction::save_entry_with(
+            path,
+            category,
+            CommandEntry {
+                command: (*command).into(),
+                description: (*description).into(),
+            },
+            true,
+            s,
+        )?,
+        ["edit"] => editor::edit_all_interactive(path, &editor::ExternalEditor, s.input, s.output)?,
+        ["edit", category] => {
+            validate_category(category).map_err(Error)?;
+            editor::edit_category_interactive(
                 path,
                 category,
-                CommandEntry {
-                    command: command.clone(),
-                    description: description.clone(),
-                },
-                input,
-                output,
-            )?
+                &editor::ExternalEditor,
+                s.input,
+                s.output,
+            )?;
         }
-        [action, category, number] if action == "edit" => {
-            checked_category(category)?;
-            let data = config::load(path)?;
-            let entries = data.get(category).ok_or_else(|| {
-                Error(format!(
-                    "Category \"{category}\" does not exist. Run `cmdnavi list`."
-                ))
-            })?;
-            let index = number
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .ok_or_else(|| Error("Choose an item number starting at 1.".into()))?;
-            crate::interaction::edit_entry(path, category, index, entries, input, output)?;
+        ["edit", category, item] => {
+            let entries = entries(path, category)?;
+            let i = interaction::resolve_item(&entries, item)?;
+            interaction::edit_entry_with(path, category, i, &entries, s)?;
         }
-        [command, query] if command == "--search" => search(path, query, output)?,
-        [command, option]
-            if matches!(command.as_str(), "add" | "edit" | "remove" | "list")
-                && matches!(option.as_str(), "--help" | "-h") =>
-        {
-            write!(output, "{HELP}")?
+        ["remove" | "--copy", category] => {
+            let entries = entries(path, category)?;
+            if let Some(i) = interaction::pick_entry(category, &entries, s)? {
+                if strings[0] == "remove" {
+                    interaction::remove_entry(path, category, i, &entries, s)?;
+                } else {
+                    clipboard::copy(&entries[i].command)?;
+                    writeln!(s.output, "Copied command from [{category}].")?;
+                }
+            }
         }
-        [command, category] if command == "add" => add(path, category, input, output)?,
-        [command, category] if command == "edit" => {
-            checked_category(category)?;
-            editor::edit_category_interactive(path, category, &ExternalEditor, input, output)?;
+        ["remove" | "--copy", category, item] => {
+            let entries = entries(path, category)?;
+            let i = interaction::resolve_item(&entries, item)?;
+            if strings[0] == "remove" {
+                interaction::remove_entry(path, category, i, &entries, s)?;
+            } else {
+                clipboard::copy(&entries[i].command)?;
+                writeln!(s.output, "Copied command from [{category}].")?;
+            }
         }
-        [command, category] if command == "remove" => remove(path, category, input, output)?,
-        [command, ..] if matches!(command.as_str(), "list" | "help" | "version") => {
+        ["--move", source, item, target] => {
+            let entries = entries(path, source)?;
+            let i = interaction::resolve_item(&entries, item)?;
+            interaction::move_entry(path, source, i, &entries, target)?;
+            writeln!(s.output, "Moved command to [{target}].")?;
+        }
+        ["--rename-category", old, new] => {
+            let entries = entries(path, old)?;
+            rename_category(path, old, new, &entries)?;
+            writeln!(s.output, "Renamed [{old}] to [{new}].")?;
+        }
+        ["--remove-category", category] => {
+            let entries = entries(path, category)?;
+            if s.confirm(&format!(
+                "Remove [{category}] and its {} commands? [y/N]: ",
+                entries.len()
+            ))? {
+                config::update(path, |data| {
+                    if data.get(*category) != Some(&entries) {
+                        return Err(interaction::conflict());
+                    }
+                    data.remove(*category);
+                    Ok(())
+                })?;
+                writeln!(
+                    s.output,
+                    "Removed category. Use `cmdnavi --undo` to restore it."
+                )?;
+            } else {
+                writeln!(s.output, "Cancelled.")?;
+            }
+        }
+        ["--search", query] => search(path, query, s.output)?,
+        ["--" | "--show", category] => show(path, category, s.output)?,
+        ["--show" | "--print", category, item] => {
+            let entries = entries(path, category)?;
+            let i = interaction::resolve_item(&entries, item)?;
+            if strings[0] == "--print" {
+                write!(s.output, "{}", entries[i].command)?;
+            } else {
+                write_entry(s.output, &entries[i])?;
+            }
+        }
+        ["remove" | "--copy" | "--show" | "--print"] => {
             return Err(Error(format!(
-                "command \"{command}\" does not accept arguments\n\n{HELP}"
+                "`{}` needs a category.\nTry `cmdnavi {} network` or `cmdnavi --help`.",
+                strings[0], strings[0]
             )));
+        }
+        [option] if option.starts_with('-') => {
+            return Err(Error(format!(
+                "unknown option \"{option}\".\nRun `cmdnavi --help` for supported options."
+            )));
+        }
+        [category] => show(path, category, s.output)?,
+        ["list" | "help" | "version", ..] => {
+            return Err(Error(
+                "This command does not accept arguments. Run `cmdnavi --help`.".into(),
+            ));
         }
         _ => {
             return Err(Error(format!(
-                "the command could not be understood.\nPlease use one of the forms shown below.\n\n{HELP}"
+                "The command could not be understood.\n{HELP}"
             )));
         }
     }
     Ok(())
 }
 
-fn missing_category(command: &str) -> Error {
-    Error(format!(
-        "`{command}` needs a category.\nAdd a category name as shown below.\n\nUsage:\n  cmdnavi {command} <category>"
-    ))
+fn action_help(action: &str, output: &mut dyn Write) -> Result<()> {
+    let text = match action {
+        "add" => {
+            "cmdnavi add [category] [\"command\"] [\"description\"]\nChoose/create a category; Tab completes categories only here. The command field completes saved commands in that category. Description has no completion. Enter skips the description; Ctrl+C or /cancel cancels.\nMultiline paste is supported in a terminal. In scripts, pass quoted arguments. Omitting description preserves an existing description."
+        }
+        "edit" => {
+            "cmdnavi edit [category] [item]\nWithout an item, edit YAML using VISUAL/EDITOR. With a number or quoted saved command, edit that item with the current values prefilled. Tab completes items only after the category. Ctrl+C or /cancel cancels."
+        }
+        "remove" => {
+            "cmdnavi remove <category> [item]\nChoose a number or exact saved command; Tab completes items after the category. Removal requires y/yes. Enter, q or Ctrl+C at selection cancels. `cmdnavi --undo` restores the last change."
+        }
+        _ => {
+            "cmdnavi list\nPrint category names only, one per line, suitable for scripts. `cmdnavi` opens the browser; --config-path prints the data location."
+        }
+    };
+    writeln!(output, "Usage:\n  {text}")?;
+    Ok(())
 }
 
-fn checked_category(category: &str) -> Result<()> {
-    validate_category(category).map_err(Error)
+pub fn entries(path: &Path, category: &str) -> Result<Vec<CommandEntry>> {
+    validate_category(category).map_err(Error)?;
+    config::load(path)?.remove(category).ok_or_else(|| Error(format!("Category \"{category}\" does not exist. Run `cmdnavi list` or `cmdnavi add {category}`.")))
+}
+pub fn rename_category(path: &Path, old: &str, new: &str, snapshot: &[CommandEntry]) -> Result<()> {
+    validate_category(new).map_err(Error)?;
+    if old == new {
+        return Ok(());
+    }
+    config::update(path, |data| {
+        if data.get(old).map(Vec::as_slice) != Some(snapshot) {
+            return Err(interaction::conflict());
+        }
+        if data.contains_key(new) {
+            return Err(Error(
+                "That category already exists. Choose another name or move individual commands."
+                    .into(),
+            ));
+        }
+        let entries = data.remove(old).unwrap();
+        data.insert(new.into(), entries);
+        Ok(())
+    })
 }
 
 pub fn show(path: &Path, category: &str, output: &mut dyn Write) -> Result<()> {
-    checked_category(category)?;
-    let config = config::load(path)?;
-    let entries = config
-        .get(category)
-        .ok_or_else(|| {
-            Error(format!(
-                "category \"{category}\" does not exist.\nRun `cmdnavi list` to see your categories. To create it, use `cmdnavi add {category}` or `cmdnavi edit {category}`."
-            ))
-        })?;
+    let entries = entries(path, category)?;
+    writeln!(output, "[{category}] · {} commands", entries.len())?;
     if entries.is_empty() {
-        writeln!(
-            output,
-            "No commands in \"{category}\" yet.\nAdd one with `cmdnavi add {category}`."
-        )?;
+        writeln!(output, "No commands yet. Use `cmdnavi add {category}`.")?;
     }
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            writeln!(output)?;
-        }
+    for (i, entry) in entries.iter().enumerate() {
+        writeln!(output, "\n[{}]", i + 1)?;
         write_entry(output, entry)?;
     }
     Ok(())
 }
-
 fn write_entry(output: &mut dyn Write, entry: &CommandEntry) -> Result<()> {
     writeln!(output, "{}", entry.command)?;
     for line in entry.description.lines() {
@@ -174,7 +323,6 @@ fn write_entry(output: &mut dyn Write, entry: &CommandEntry) -> Result<()> {
     }
     Ok(())
 }
-
 pub fn overview(path: &Path, output: &mut dyn Write) -> Result<()> {
     let data = config::load(path)?;
     writeln!(output, "cmdnavi — your command reference\n")?;
@@ -184,48 +332,39 @@ pub fn overview(path: &Path, output: &mut dyn Write) -> Result<()> {
             "No commands saved yet.\n\nGet started:  cmdnavi add network"
         )?;
     } else {
-        let total: usize = data.values().map(Vec::len).sum();
-        writeln!(output, "{} categories · {} commands\n", data.len(), total)?;
-        let width = data.keys().map(String::len).max().unwrap_or(0);
-        for (category, entries) in &data {
-            writeln!(output, "  {category:width$}  {} commands", entries.len())?;
-        }
         writeln!(
             output,
-            "\nView:        cmdnavi <category>\nAdd:         cmdnavi add <category>"
+            "{} categories · {} commands\n",
+            data.len(),
+            data.values().map(Vec::len).sum::<usize>()
         )?;
+        let width = data.keys().map(String::len).max().unwrap_or(0);
+        for (name, entries) in &data {
+            writeln!(output, "  {name:width$}  {} commands", entries.len())?;
+        }
     }
     writeln!(
         output,
-        "Browse:      cmdnavi --browse\nSearch:      cmdnavi --search <text>\nHelp:        cmdnavi --help"
+        "\nView: cmdnavi --show <category>\nBrowse: cmdnavi --browse\nSearch: cmdnavi --search <text>\nHelp: cmdnavi --help\nSaved data: {}",
+        path.display()
     )?;
     Ok(())
 }
-
 pub fn search(path: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
-    let query = query.trim();
-    if query.is_empty() {
+    if query.trim().is_empty() {
         return Err(Error(
-            "search text is empty.\nTry `cmdnavi --search docker`.".into(),
+            "Search text is empty. Try `cmdnavi --search docker`.".into(),
         ));
     }
-    let needle = query.to_lowercase();
     let data = config::load(path)?;
     let mut count = 0;
-    for (category, entries) in &data {
-        let matches: Vec<_> = entries
+    for (category, entries) in data {
+        for (i, entry) in entries
             .iter()
-            .filter(|entry| {
-                category.to_lowercase().contains(&needle)
-                    || entry.command.to_lowercase().contains(&needle)
-                    || entry.description.to_lowercase().contains(&needle)
-            })
-            .collect();
-        if matches.is_empty() {
-            continue;
-        }
-        writeln!(output, "[{category}]\n")?;
-        for entry in matches {
+            .enumerate()
+            .filter(|(_, e)| matches_query(&category, e, query))
+        {
+            writeln!(output, "[{category}] #{}", i + 1)?;
             write_entry(output, entry)?;
             writeln!(output)?;
             count += 1;
@@ -234,120 +373,47 @@ pub fn search(path: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
     if count == 0 {
         writeln!(
             output,
-            "No matches for \"{query}\".\nTry a shorter keyword or run `cmdnavi list` to see your categories."
+            "No matches for \"{query}\". Try fewer words or `cmdnavi list`."
         )?;
     } else {
         writeln!(output, "{count} matching commands.")?;
     }
     Ok(())
 }
-
 pub fn list(path: &Path, output: &mut dyn Write) -> Result<()> {
-    for category in config::load(path)?.keys() {
-        writeln!(output, "{category}")?;
+    for name in config::load(path)?.keys() {
+        writeln!(output, "{name}")?;
     }
     Ok(())
 }
-
 pub fn add(
     path: &Path,
     category: &str,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<()> {
-    crate::interaction::add(path, category, input, output)
+    interaction::add(path, category, input, output)
 }
-
 pub fn remove(
     path: &Path,
     category: &str,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<()> {
-    checked_category(category)?;
-    let data = config::load(path)?;
-    let entries = data
-        .get(category)
-        .ok_or_else(|| {
-            Error(format!(
-                "nothing was removed because category \"{category}\" does not exist.\nRun `cmdnavi list` and choose one of your existing categories."
-            ))
-        })?;
-    if entries.is_empty() {
-        return Err(Error(format!(
-            "category \"{category}\" has no commands to remove.\nAdd one with `cmdnavi add {category}` first."
-        )));
+    let entries = entries(path, category)?;
+    let mut session = Session::new(input, output, false);
+    if let Some(i) = interaction::pick_entry(category, &entries, &mut session)? {
+        interaction::remove_entry(path, category, i, &entries, &mut session)?;
     }
-    for (index, entry) in entries.iter().enumerate() {
-        writeln!(
-            output,
-            "[{}] {}\n    {}\n",
-            index + 1,
-            entry.command,
-            entry.description
-        )?;
-    }
-    let selection = loop {
-        write!(
-            output,
-            "Select item to remove (1-{}, Enter or q to cancel): ",
-            entries.len()
-        )?;
-        output.flush()?;
-        let selection = read_line(input)?;
-        let selection = selection.trim();
-        if selection.is_empty() || selection.eq_ignore_ascii_case("q") {
-            writeln!(output, "Cancelled.")?;
-            return Ok(());
-        }
-        match selection.parse::<usize>() {
-            Ok(number) if (1..=entries.len()).contains(&number) => break number,
-            _ => writeln!(
-                output,
-                "Choose a number between 1 and {}, or Enter to cancel.",
-                entries.len()
-            )?,
-        }
-    };
-    let command = entries[selection - 1].command.clone();
-    write!(output, "Remove \"{command}\"? [y/N]: ")?;
-    output.flush()?;
-    let confirmation = read_line(input)?;
-    if !matches!(
-        confirmation.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ) {
-        writeln!(output, "Cancelled.")?;
-        return Ok(());
-    }
-    let original_entries = data[category].clone();
-    config::update(path, |current| {
-        if current.get(category) != Some(&original_entries) {
-            return Err(Error(format!(
-                "nothing was removed because category \"{category}\" changed while you were choosing an item.\nRun `cmdnavi remove {category}` again and choose from the updated list."
-            )));
-        }
-        current
-            .get_mut(category)
-            .expect("category was checked")
-            .remove(selection - 1);
-        Ok(())
-    })?;
-    writeln!(output, "Removed \"{command}\" from \"{category}\".")?;
     Ok(())
 }
-
 pub(crate) fn read_line(input: &mut dyn BufRead) -> Result<String> {
     let mut value = String::new();
     if input.read_line(&mut value)? == 0 {
-        return Err(Error(
-            "the operation stopped because an input value is missing.\nProvide every requested value, or run the command interactively."
-                .into(),
-        ));
+        return Err(Error("The operation stopped because an input value is missing. Provide every requested value, or run interactively.".into()));
     }
-    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+    Ok(value.trim_end_matches(['\r', '\n']).into())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

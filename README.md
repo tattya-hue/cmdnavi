@@ -105,18 +105,23 @@ cmdnavi --version
 | 操作 | キー |
 | --- | --- |
 | カテゴリ・コマンド・説明から絞り込む | 文字を入力（日本語も可） |
+| 検索語を途中編集する | ← / → / Home / End / Delete |
 | 項目を選ぶ | ↑ / ↓ |
 | 選んだコマンドをコピー | Enter |
-| 登録する | Ctrl+A |
-| 選んだ項目を編集する | Ctrl+E |
+| 登録 / 編集 / 削除 | Ctrl+A / Ctrl+E / Ctrl+D |
+| 項目を移動 / カテゴリ名を変更 | Ctrl+G / Ctrl+N |
+| 直前の変更を取り消す・やり直す | Ctrl+Z |
+| 再読み込み（外部からの更新は自動反映） | Ctrl+R |
 | 検索文字を消す | Ctrl+U |
 | 長いコマンド・説明をスクロール | PageUp / PageDown |
+| ヘルプ・エラー全文を読む | F1（↑↓でスクロール） |
 | 終了する | Esc / Ctrl+C |
 
 対話画面では空白で区切った複数の検索語すべてを含む項目を表示します。
 コマンドと説明は詳細欄で折り返して表示し、日本語の文字幅も考慮します。
 `NO_COLOR`を設定すると色を使いません。画面が小さい場合は拡大方法を案内します。
 Windowsのコピー機能は標準のWindows PowerShellを使用します。
+WSLではWindows PowerShellへのフォールバックも使います。コピー処理中も対話画面は操作可能です。
 LinuxのコピーにはWaylandで`wl-copy`（wl-clipboard）、X11で`xclip`または`xsel`が必要です。
 利用できない場合も画面内に理由を表示し、閲覧を続けられます。
 
@@ -126,11 +131,13 @@ LinuxのコピーにはWaylandで`wl-copy`（wl-clipboard）、X11で`xclip`ま�
 `cmdnavi add`では既存カテゴリの`#番号`か新しい名前を入力します。
 Enterだけなら`general`に保存します。コマンドが空欄ならその場で入力し直せます。
 説明はEnterで省略でき、入力中は`/cancel`で中止できます。
-同じカテゴリに同じコマンドがあれば重複追加せず、説明が異なる場合だけ更新を確認します。
+同じカテゴリに同じコマンドがあれば重複追加しません。説明の省略時は既存の説明を保持し、
+明示的に説明を変更した場合だけ更新を確認します。
 
 対話画面のCtrl+E、または`cmdnavi edit network 1`で1件ずつ編集できます。
 番号は対話画面のカテゴリ名の横に表示される番号です。
-Enterで現在値を保持し、説明に`/clear`を入力すると説明を削除します。
+ターミナルでは現在値が入力済みで開き、左右キーなどで直接修正できます。
+Enterで確定し、説明を消す場合は入力欄を空にするか`/clear`を入力します。
 複数行の内容をまとめて編集する場合は`cmdnavi edit network`のYAML編集が使えます。
 
 `--search`は大文字・小文字を区別せず、
@@ -145,7 +152,7 @@ Enterで現在値を保持し、説明に`/clear`を入力すると説明を削�
 
 ```text
 $ cmdnavi add network
-Add to [network] · /cancel to cancel
+Add to [network] · Tab completes saved commands · Ctrl+C or /cancel cancels
 Command: ip addr
 Description (optional, Enter to skip): IPアドレスを確認する
 Created category "network".
@@ -156,12 +163,54 @@ Saved command in [network].
 
 ```text
 $ cmdnavi network
+[network] · 1 commands
+
+[1]
 ip addr
   IPアドレスを確認する
 ```
 
 カテゴリ名には英数字、`_`、`-`を使用できます。`add`、`edit`、`list`、
 `remove`、`help`、`version`は予約語です。
+
+## 補完・入力編集
+
+Bash・Zsh・Fish・PowerShell向けに、入力位置に応じた動的補完を提供します。
+Bashで今のシェルへ読み込む場合:
+
+```bash
+source <(cmdnavi --completions bash)
+```
+
+操作名の位置には操作名・カテゴリ、カテゴリ引数にはカテゴリ、項目指定やコマンド入力欄には
+そのカテゴリの登録済みコマンドを出します。説明欄・検索語にはコマンド候補を出しません。
+登録・編集フォームのTab補完と左右キーによる編集は追加設定なしで利用できます。
+各シェルへの保存方法と具体例は[補完・入力編集の説明](docs/completion.md)を参照してください。
+
+## 項目・カテゴリの整理
+
+```sh
+cmdnavi --show network                 # 項目番号付きで表示
+cmdnavi --show -ops                    # '-'で始まるカテゴリも表示可能
+cmdnavi --print network "ip addr"       # コマンド本文だけを出力（末尾改行も追加しない）
+cmdnavi --copy network 1               # 1件をコピー
+cmdnavi edit network "ip addr"          # 番号だけでなく登録済み本文でも指定
+cmdnavi remove network 1               # 確認して削除
+cmdnavi --move network 1 tools         # 1件を別カテゴリへ移動
+cmdnavi --rename-category tools ops    # カテゴリ名を変更
+cmdnavi --remove-category ops          # 確認してカテゴリ全体を削除
+cmdnavi --undo                         # 直前の保存を取り消す（再実行でやり直す）
+cmdnavi --config-path                  # 実際の保存先を確認
+```
+
+項目には1から始まる番号、または保存したコマンド本文を指定します。空白がある本文は引用符で囲んでください。
+番号は現在のカテゴリ内での並び順なので、項目の削除・移動で変わります。
+同じ本文が重複している場合や数値だけのコマンドを指定する場合は、一覧の項目番号を使ってください。
+
+保存時には同じフォルダの`config.yaml.undo`へ直前と保存後の状態を記録します。
+取り消しは1段階で、対象はcmdnavi経由で行った直前の変更です。
+外部でYAMLが変更されていた場合は上書きせずに停止します。
+バックアップにも登録内容が含まれるため、データを移すときは必要に応じて一緒に扱ってください。
 
 ## 設定ファイル
 
@@ -295,6 +344,7 @@ cargo test
 cargo build --release
 cargo build
 python3 tests/terminal_smoke.py # Linuxの疑似端末で対話操作を検証
+python3 tests/usability_smoke.py # 入力編集・貼り付け・Bash/Zsh/Fish補完を検証
 ```
 
 

@@ -15,7 +15,7 @@ fn main() {
         }
         let mut input = stdin.lock();
         let mut output = stdout.lock();
-        cmdnavi::cli::run(&args, &path, &mut input, &mut output)
+        cmdnavi::cli::run_with_terminal(&args, &path, &mut input, &mut output, terminal)
     });
     if let Err(error) = result {
         print_error(&error);

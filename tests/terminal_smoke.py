@@ -21,6 +21,8 @@ def check_browser(root):
     env = dict(os.environ, XDG_CONFIG_HOME=str(root), TERM="xterm-256color", NO_COLOR="1",
                WAYLAND_DISPLAY="test", PATH=str(root) + os.pathsep + os.environ["PATH"])
     env.pop("DISPLAY", None)
+    env.pop("WSL_INTEROP", None)
+    env.pop("WSL_DISTRO_NAME", None)
     copied = root / "copied"
     env["CMDNAVI_TEST_CLIPBOARD"] = str(copied)
     helper = root / "wl-copy"
@@ -72,24 +74,23 @@ def check_browser(root):
         helper.write_text("#!/bin/sh\nexit 1\n")
         send("\r")
         expect("Could not copy")
+        send("\x1b")  # close full error message
+        expect("Ctrl+E Edit")
         send("\x05")  # Ctrl+E
         expect("New command:")
         send("\n")
         expect("New description")
-        send("updated description\n")
-        expect("Press Enter to return")
-        send("\n")
-        expect("No matches")  # Existing query no longer matches the changed description.
+        send("\x15updated description\n")
+        expect("Search cleared")
+        expect_text = "updated description"
         send("\x15")
-        expect("updated description")
+        expect(expect_text)
         send("\x01")  # Ctrl+A
         expect("Category (name")
         send("#1\n")
         expect("Command:")
         send("pwd\n")
         expect("Description (optional")
-        send("\n")
-        expect("Press Enter to return")
         send("\n")
         expect("2 matches")
         send("\x1b[B")  # Down

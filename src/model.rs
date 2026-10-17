@@ -16,6 +16,14 @@ impl CommandEntry {
         if self.command.trim().is_empty() {
             return Err("command must not be empty");
         }
+        if self
+            .command
+            .chars()
+            .chain(self.description.chars())
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+        {
+            return Err("command and description must not contain terminal control characters");
+        }
         Ok(())
     }
 }
@@ -49,6 +57,13 @@ pub fn validate_category(category: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub fn matches_query(category: &str, entry: &CommandEntry, query: &str) -> bool {
+    let haystack = format!("{category}\n{}\n{}", entry.command, entry.description).to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| haystack.contains(&word.to_lowercase()))
 }
 
 #[cfg(test)]

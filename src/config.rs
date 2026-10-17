@@ -127,9 +127,44 @@ pub fn update<T>(path: &Path, operation: impl FnOnce(&mut Config) -> Result<T>) 
     })?;
 
     let mut config = load(path)?;
+    let before = config.clone();
     let result = operation(&mut config)?;
-    save(path, &config)?;
+    if config != before {
+        validate_config(&config).map_err(Error)?;
+        let record = UndoRecord {
+            before,
+            after: config.clone(),
+        };
+        let yaml = yaml_serde::to_string(&record).map_err(|e| Error(e.to_string()))?;
+        save_text_atomically(&undo_path(path), &yaml)?;
+        save(path, &config)?;
+    }
     Ok(result)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UndoRecord {
+    before: Config,
+    after: Config,
+}
+
+fn undo_path(path: &Path) -> PathBuf {
+    path.with_extension("yaml.undo")
+}
+
+/// The snapshot is checked under the normal write lock; external edits are never overwritten.
+pub fn undo(path: &Path) -> Result<()> {
+    update(path, |current| {
+        let yaml = fs::read_to_string(undo_path(path)).map_err(|_| Error("No saved change to undo. A backup is created when you add, edit, move or remove data.".into()))?;
+        let record: UndoRecord = yaml_serde::from_str(&yaml)
+            .map_err(|e| Error(format!("The undo backup could not be read: {e}")))?;
+        validate_config(&record.before).map_err(Error)?;
+        if *current != record.after {
+            return Err(Error("The configuration changed outside cmdnavi. Nothing was overwritten; inspect the .yaml.undo backup manually.".into()));
+        }
+        *current = record.before;
+        Ok(())
+    })
 }
 
 fn save_text_atomically(path: &Path, contents: &str) -> Result<()> {

@@ -39,16 +39,24 @@ def main():
     output = ROOT / "dist"
     output.mkdir(exist_ok=True)
     files = [binary, ROOT / "README.md", ROOT / "LICENSE", ROOT / "RELEASE_NOTES.md"]
+    files += sorted((ROOT / "completions").iterdir())
+    files += [ROOT / "docs" / "completion.md"]
+
+    def member(file):
+        if file.parent.name in {"completions", "docs"}:
+            return f"{name}/{file.parent.name}/{file.name}"
+        return f"{name}/{file.name}"
+
     if args.target.endswith("windows-msvc"):
         archive = output / f"{name}.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
             for file in files:
-                package.write(file, f"{name}/{file.name}")
+                package.write(file, member(file))
     else:
         archive = output / f"{name}.tar.gz"
         with tarfile.open(archive, "w:gz") as package:
             for file in files:
-                package.add(file, arcname=f"{name}/{file.name}")
+                package.add(file, arcname=member(file))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8", newline="\n")
     print(archive)

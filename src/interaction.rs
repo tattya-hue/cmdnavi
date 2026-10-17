@@ -1,47 +1,79 @@
-//! Line-based forms shared by the CLI and terminal browser.
-use crate::cli::read_line;
-use crate::model::{CommandEntry, validate_category};
+use crate::completion::Context;
+use crate::model::{CommandEntry, Config, validate_category};
+use crate::session::Session;
 use crate::{Error, Result, config};
 use std::io::{BufRead, Write};
 use std::path::Path;
-
-fn prompt(input: &mut dyn BufRead, output: &mut dyn Write, label: &str) -> Result<Option<String>> {
-    write!(output, "{label}")?;
-    output.flush()?;
-    let value = read_line(input)?;
-    if value.trim() == "/cancel" {
-        writeln!(output, "Cancelled.")?;
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
-}
 
 pub fn choose_category(
     path: &Path,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<Option<String>> {
+    choose_category_with(path, &mut Session::new(input, output, false))
+}
+pub fn add(
+    path: &Path,
+    category: &str,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<()> {
+    add_with(path, category, &mut Session::new(input, output, false))
+}
+pub fn save_entry(
+    path: &Path,
+    category: &str,
+    entry: CommandEntry,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<()> {
+    save_entry_with(
+        path,
+        category,
+        entry,
+        true,
+        &mut Session::new(input, output, false),
+    )
+}
+pub fn edit_entry(
+    path: &Path,
+    category: &str,
+    index: usize,
+    snapshot: &[CommandEntry],
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<()> {
+    edit_entry_with(
+        path,
+        category,
+        index,
+        snapshot,
+        &mut Session::new(input, output, false),
+    )
+}
+
+pub fn choose_category_with(path: &Path, session: &mut Session<'_>) -> Result<Option<String>> {
     let data = config::load(path)?;
     let categories: Vec<_> = data.keys().collect();
     writeln!(
-        output,
-        "Choose a category or type a new name. /cancel to cancel."
+        session.output,
+        "Choose a category or type a new name. Tab completes; ↑↓ recall candidates. Ctrl+C or /cancel cancels."
     )?;
-    for (index, category) in categories.iter().enumerate() {
+    for (i, name) in categories.iter().enumerate() {
         writeln!(
-            output,
+            session.output,
             "  #{}  {} ({} commands)",
-            index + 1,
-            category,
-            data[*category].len()
+            i + 1,
+            name,
+            data[*name].len()
         )?;
     }
     loop {
-        let Some(value) = prompt(
-            input,
-            output,
+        let Some(value) = session.ask(
             "Category (name / #number, Enter = general): ",
+            "",
+            Context::Categories,
+            &data,
         )?
         else {
             return Ok(None);
@@ -52,11 +84,14 @@ pub fn choose_category(
                 .parse::<usize>()
                 .ok()
                 .and_then(|n| n.checked_sub(1))
-                .and_then(|n| categories.get(n))
+                .and_then(|i| categories.get(i))
             {
-                Some(category) => category.as_str(),
+                Some(name) => name.as_str(),
                 None => {
-                    writeln!(output, "Choose one of the #numbers shown above.")?;
+                    writeln!(
+                        session.output,
+                        "Choose one of the #numbers above, or type a name."
+                    )?;
                     continue;
                 }
             }
@@ -67,89 +102,88 @@ pub fn choose_category(
         };
         match validate_category(category) {
             Ok(()) => return Ok(Some(category.to_owned())),
-            Err(message) => writeln!(output, "{message}")?,
+            Err(message) => writeln!(session.output, "{message}")?,
         }
     }
 }
 
-pub fn add(
-    path: &Path,
-    category: &str,
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
-) -> Result<()> {
+pub fn add_with(path: &Path, category: &str, session: &mut Session<'_>) -> Result<()> {
     validate_category(category).map_err(Error)?;
-    // Detect an unreadable configuration before asking the user to type anything.
-    config::load(path)?;
-    writeln!(output, "Add to [{category}] · /cancel to cancel")?;
+    let data = config::load(path)?;
+    writeln!(
+        session.output,
+        "Add to [{category}] · Tab completes saved commands · Ctrl+C or /cancel cancels"
+    )?;
     let command = loop {
-        let Some(command) = prompt(input, output, "Command: ")? else {
+        let Some(value) =
+            session.ask("Command: ", "", Context::Commands(category.into()), &data)?
+        else {
             return Ok(());
         };
-        if !command.trim().is_empty() {
-            break command;
+        if !value.trim().is_empty() {
+            break value;
         }
-        writeln!(output, "Enter a command to save.")?;
+        writeln!(session.output, "Enter a command to save.")?;
     };
-    let Some(description) = prompt(input, output, "Description (optional, Enter to skip): ")?
-    else {
+    let Some(description) = session.plain("Description (optional, Enter to skip): ")? else {
         return Ok(());
     };
-    save_entry(
+    session.finish_form()?;
+    save_entry_with(
         path,
         category,
         CommandEntry {
             command,
-            description,
+            description: description.clone(),
         },
-        input,
-        output,
+        !description.is_empty(),
+        session,
     )
 }
 
-pub fn save_entry(
+pub fn save_entry_with(
     path: &Path,
     category: &str,
-    entry: CommandEntry,
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
+    mut entry: CommandEntry,
+    description_provided: bool,
+    session: &mut Session<'_>,
 ) -> Result<()> {
     validate_category(category).map_err(Error)?;
-    entry.validate().map_err(|message| Error(message.into()))?;
-    let snapshot = config::load(path)?;
-    let original = snapshot.get(category);
+    entry.validate().map_err(|e| Error(e.into()))?;
+    let data = config::load(path)?;
+    let original = data.get(category);
     let duplicate = original.and_then(|entries| {
         entries
             .iter()
             .position(|saved| saved.command.trim() == entry.command.trim())
     });
-    if let Some(index) = duplicate {
-        let saved = &original.unwrap()[index];
-        if saved.description == entry.description {
-            writeln!(output, "Already saved in [{category}]. No changes.")?;
+    if let Some(i) = duplicate {
+        let saved = &original.unwrap()[i];
+        if !description_provided {
+            entry.description = saved.description.clone();
+        }
+        if entry.description == saved.description {
+            writeln!(session.output, "Already saved in [{category}]. No changes.")?;
             return Ok(());
         }
         writeln!(
-            output,
+            session.output,
             "Already saved in [{category}]:\n  {}\n  {}",
             saved.command, saved.description
         )?;
-        let Some(answer) = prompt(input, output, "Replace its description? [y/N]: ")? else {
-            return Ok(());
-        };
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            writeln!(output, "Cancelled.")?;
+        if !session.confirm("Replace its description? [y/N]: ")? {
+            writeln!(session.output, "Cancelled.")?;
             return Ok(());
         }
     }
-    config::update(path, |data| {
-        if let Some(index) = duplicate {
-            if data.get(category) != original {
+    config::update(path, |current| {
+        if let Some(i) = duplicate {
+            if current.get(category) != original {
                 return Err(conflict());
             }
-            data.get_mut(category).unwrap()[index].description = entry.description;
+            current.get_mut(category).unwrap()[i].description = entry.description;
         } else {
-            let entries = data.entry(category.into()).or_default();
+            let entries = current.entry(category.into()).or_default();
             if entries
                 .iter()
                 .any(|saved| saved.command.trim() == entry.command.trim())
@@ -161,10 +195,10 @@ pub fn save_entry(
         Ok(())
     })?;
     if original.is_none() {
-        writeln!(output, "Created category \"{category}\".")?;
+        writeln!(session.output, "Created category \"{category}\".")?;
     }
     writeln!(
-        output,
+        session.output,
         "{} command in [{category}].",
         if duplicate.is_some() {
             "Updated"
@@ -175,32 +209,41 @@ pub fn save_entry(
     Ok(())
 }
 
-fn conflict() -> Error {
-    Error(
-        "This category changed while you were editing. Nothing was overwritten. Please try again."
-            .into(),
-    )
+pub(crate) fn conflict() -> Error {
+    Error("This category changed while you were editing. Nothing was overwritten. Please reload and try again.".into())
 }
 
-/// `index` is zero-based; the snapshot prevents editing a different item after a concurrent change.
-pub fn edit_entry(
+pub fn edit_entry_with(
     path: &Path,
     category: &str,
     index: usize,
     snapshot: &[CommandEntry],
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
+    session: &mut Session<'_>,
 ) -> Result<()> {
     let old = snapshot
         .get(index)
-        .ok_or_else(|| Error("Choose an existing item number.".into()))?;
+        .ok_or_else(|| Error("Choose an existing item number or saved command.".into()))?;
+    let data = Config::from([(category.into(), snapshot.to_vec())]);
     writeln!(
-        output,
-        "Edit [{category}] · Enter keeps the current value · /cancel cancels\nCommand: {}\nDescription: {}",
-        old.command, old.description
+        session.output,
+        "Edit [{category}] · Enter keeps current value · Ctrl+C or /cancel cancels"
     )?;
+    if !session.terminal {
+        writeln!(
+            session.output,
+            "Command: {}\nDescription: {}",
+            old.command, old.description
+        )?;
+    }
     let command = loop {
-        let Some(value) = prompt(input, output, "New command: ")? else {
+        let initial = if session.terminal { &old.command } else { "" };
+        let Some(value) = session.ask(
+            "New command: ",
+            initial,
+            Context::Commands(category.into()),
+            &data,
+        )?
+        else {
             return Ok(());
         };
         if value.is_empty() {
@@ -210,31 +253,43 @@ pub fn edit_entry(
             break value;
         }
         writeln!(
-            output,
+            session.output,
             "Enter a command, or press Enter to keep the current one."
         )?;
     };
-    let Some(value) = prompt(input, output, "New description (/clear to remove): ")? else {
+    let initial = if session.terminal {
+        &old.description
+    } else {
+        ""
+    };
+    let Some(value) = session.ask(
+        "New description (/clear to remove): ",
+        initial,
+        Context::None,
+        &data,
+    )?
+    else {
         return Ok(());
     };
     let description = match value.as_str() {
-        "" => old.description.clone(),
         "/clear" => String::new(),
+        "" if !session.terminal => old.description.clone(),
         _ => value,
     };
     let edited = CommandEntry {
         command,
         description,
     };
+    edited.validate().map_err(|e| Error(e.into()))?;
     if edited == *old {
-        writeln!(output, "No changes.")?;
+        writeln!(session.output, "No changes.")?;
         return Ok(());
     }
-    config::update(path, |data| {
-        if data.get(category).map(Vec::as_slice) != Some(snapshot) {
+    config::update(path, |current| {
+        if current.get(category).map(Vec::as_slice) != Some(snapshot) {
             return Err(conflict());
         }
-        let entries = data.get_mut(category).unwrap();
+        let entries = current.get_mut(category).unwrap();
         if entries
             .iter()
             .enumerate()
@@ -247,10 +302,147 @@ pub fn edit_entry(
         entries[index] = edited;
         Ok(())
     })?;
-    writeln!(output, "Updated command in [{category}].")?;
+    writeln!(session.output, "Updated command in [{category}].")?;
     Ok(())
 }
 
+pub fn resolve_item(entries: &[CommandEntry], selector: &str) -> Result<usize> {
+    if let Ok(number) = selector
+        .strip_prefix('#')
+        .unwrap_or(selector)
+        .parse::<usize>()
+    {
+        return number
+            .checked_sub(1)
+            .filter(|i| *i < entries.len())
+            .ok_or_else(|| {
+                Error(format!(
+                    "Choose an item number between 1 and {}.",
+                    entries.len()
+                ))
+            });
+    }
+    let indices: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.command == selector)
+        .map(|(i, _)| i)
+        .collect();
+    if indices.len() == 1 {
+        Ok(indices[0])
+    } else {
+        Err(Error("Choose an existing item number or the exact saved command. Use a number if commands are duplicated.".into()))
+    }
+}
+
+pub fn pick_entry(
+    category: &str,
+    entries: &[CommandEntry],
+    session: &mut Session<'_>,
+) -> Result<Option<usize>> {
+    if entries.is_empty() {
+        return Err(Error(format!(
+            "Category [{category}] has no commands. Use `cmdnavi add {category}`."
+        )));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        writeln!(
+            session.output,
+            "[{}] {}\n    {}",
+            i + 1,
+            crate::session::visible(&entry.command),
+            crate::session::visible(&entry.description)
+        )?;
+    }
+    let data = Config::from([(category.into(), entries.to_vec())]);
+    loop {
+        let Some(value) = session.ask(
+            &format!(
+                "Select item (1-{}, Tab completes, Enter or q cancels): ",
+                entries.len()
+            ),
+            "",
+            Context::Items(category.into()),
+            &data,
+        )?
+        else {
+            return Ok(None);
+        };
+        if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("q") {
+            writeln!(session.output, "Cancelled.")?;
+            return Ok(None);
+        }
+        match resolve_item(entries, &value) {
+            Ok(index) => return Ok(Some(index)),
+            Err(error) => writeln!(session.output, "{error}")?,
+        }
+    }
+}
+
+pub fn remove_entry(
+    path: &Path,
+    category: &str,
+    index: usize,
+    snapshot: &[CommandEntry],
+    session: &mut Session<'_>,
+) -> Result<()> {
+    let entry = snapshot
+        .get(index)
+        .ok_or_else(|| Error("Choose an existing item.".into()))?;
+    if !session.confirm(&format!(
+        "Remove \"{}\"? [y/N]: ",
+        crate::session::visible(&entry.command)
+    ))? {
+        writeln!(session.output, "Cancelled.")?;
+        return Ok(());
+    }
+    config::update(path, |current| {
+        if current.get(category).map(Vec::as_slice) != Some(snapshot) {
+            return Err(conflict());
+        }
+        current.get_mut(category).unwrap().remove(index);
+        Ok(())
+    })?;
+    writeln!(
+        session.output,
+        "Removed command from [{category}]. Use `cmdnavi --undo` to restore it."
+    )?;
+    Ok(())
+}
+
+pub fn move_entry(
+    path: &Path,
+    source: &str,
+    index: usize,
+    snapshot: &[CommandEntry],
+    target: &str,
+) -> Result<()> {
+    validate_category(target).map_err(Error)?;
+    if source == target {
+        return Ok(());
+    }
+    let entry = snapshot
+        .get(index)
+        .ok_or_else(|| Error("Choose an existing item.".into()))?
+        .clone();
+    config::update(path, |data| {
+        if data.get(source).map(Vec::as_slice) != Some(snapshot) {
+            return Err(conflict());
+        }
+        if data.get(target).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.command.trim() == entry.command.trim())
+        }) {
+            return Err(Error(
+                "The target category already contains this command. Nothing moved.".into(),
+            ));
+        }
+        data.get_mut(source).unwrap().remove(index);
+        data.entry(target.into()).or_default().push(entry);
+        Ok(())
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
